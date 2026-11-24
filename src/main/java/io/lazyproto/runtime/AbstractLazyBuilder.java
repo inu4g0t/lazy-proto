@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Unified snapshot-safe {@link Message.Builder} base class for Architecture v3
@@ -241,14 +242,48 @@ public abstract class AbstractLazyBuilder<
         return mergeFrom(data, 0, data.length);
     }
 
+    private boolean isEffectivelyEmptyForMerge() {
+        Base b = resolveReadBase();
+        if (b.isMultiSegment() || b.rawLength() > 0) {
+            return false;
+        }
+        Ov o = resolveReadOverlay();
+        return o == null || mergeAdapter().isOverlayEmpty(b, o);
+    }
+
+    private B concatAndReplace(byte[] incoming, int off, int len) {
+        byte[] current = toByteArray();
+        if (current.length == 0) {
+            return replaceWithBytes(incoming, off, len);
+        }
+        byte[] merged = new byte[current.length + len];
+        System.arraycopy(current, 0, merged, 0, current.length);
+        System.arraycopy(incoming, off, merged, current.length, len);
+        return replaceWithBytes(merged, 0, merged.length);
+    }
+
     @Override
     public B mergeFrom(byte[] data, int off, int len) {
-        return replaceWithBytes(data, off, len);
+        Objects.checkFromIndexSize(off, len, data.length);
+        if (len == 0) {
+            return self();
+        }
+        if (isEffectivelyEmptyForMerge()) {
+            return replaceWithBytes(data, off, len);
+        }
+        return concatAndReplace(data, off, len);
     }
 
     @Override
     public B mergeFrom(ByteString data) {
-        return replaceWithByteString(data);
+        if (data.isEmpty()) {
+            return self();
+        }
+        if (isEffectivelyEmptyForMerge()) {
+            return replaceWithByteString(data);
+        }
+        byte[] incoming = data.toByteArray();
+        return concatAndReplace(incoming, 0, incoming.length);
     }
 
     @Override
@@ -269,8 +304,15 @@ public abstract class AbstractLazyBuilder<
 
     @Override
     public B mergeFrom(CodedInputStream input, ExtensionRegistryLite extensionRegistry) throws IOException {
-        byte[] bytes = input.readRawBytes(input.getBytesUntilLimit());
-        return mergeFrom(bytes);
+        int limit = input.getBytesUntilLimit();
+        if (limit >= 0) {
+            return mergeFrom(input.readRawBytes(limit));
+        }
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        while (!input.isAtEnd()) {
+            baos.write(input.readRawByte());
+        }
+        return mergeFrom(baos.toByteArray());
     }
 
     @Override
@@ -284,10 +326,14 @@ public abstract class AbstractLazyBuilder<
     }
 
     private B mergeFromMessageLite(MessageLite other) {
-        if (other instanceof AbstractLazyMessage<?, ?, ?> lazyOther && lazyOther.isClean() && !lazyOther.isMultiSegment()) {
-            return replaceWithBytes(lazyOther.rawBuffer(), lazyOther.rawOffset(), lazyOther.rawLength());
+        if (other == this.getDefaultInstanceForType()) {
+            return self();
         }
-        return replaceWithBytes(other.toByteArray(), 0, other.getSerializedSize());
+        if (other instanceof AbstractLazyMessage<?, ?, ?> lazyOther && lazyOther.isClean() && !lazyOther.isMultiSegment()) {
+            return mergeFrom(lazyOther.rawBuffer(), lazyOther.rawOffset(), lazyOther.rawLength());
+        }
+        byte[] bytes = other.toByteArray();
+        return mergeFrom(bytes, 0, bytes.length);
     }
 
     @Override

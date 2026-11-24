@@ -261,8 +261,11 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
 
         boolean isEffectivelyEmpty() {
             if (replacedBase) return false;
-            return (base == null || base.rawLength() == 0)
-                    && (overlay == null || overlay.isEffectivelyEmpty());
+            if (base != null && base.rawLength() > 0) {
+                return overlay == null || overlay.isEffectivelyEmpty();
+            }
+            return overlay == null
+                    || WireMergeEngine.getSerializedSize(DocBase.EMPTY, overlay, DocAdapter.INSTANCE) == 0;
         }
 
         void freeze() {
@@ -371,7 +374,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                 byte st = states[i];
                 if (st == STATE_SUBDOC) {
                     DocSlot slot = subDocs[i];
-                    if (slot != null && (slot.replacedBase || (slot.overlay != null && !slot.overlay.isEffectivelyEmpty()))) {
+                    if (slot != null && !slot.isEffectivelyEmpty()) {
                         return false;
                     }
                 } else {
@@ -398,7 +401,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                 }
                 if (st == STATE_SUBDOC) {
                     DocSlot slot = subDocs[i];
-                    if (slot == null || (!slot.replacedBase && (slot.overlay == null || slot.overlay.isEffectivelyEmpty()))) {
+                    if (slot == null || slot.isEffectivelyEmpty()) {
                         continue;
                     }
                     int lenCount = base.countLenOccurrences(fn);
@@ -659,7 +662,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
             byte st = ov.states[idx];
             if (st == STATE_SUBDOC) {
                 DocSlot slot = ov.subDocs[idx];
-                return slot != null && (slot.replacedBase || (slot.overlay != null && !slot.overlay.isEffectivelyEmpty()));
+                return slot != null && !slot.isEffectivelyEmpty();
             }
             return true;
         }
@@ -1150,6 +1153,9 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
         }
 
         public Builder remove(int fieldNumber) {
+            if (!has(fieldNumber)) {
+                return this;
+            }
             DocOverlay ov = ensureMutableOverlay();
             int idx = ov.getOrAllocEntry(fieldNumber);
             ov.states[idx] = STATE_DELETED;

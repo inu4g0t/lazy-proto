@@ -76,39 +76,44 @@ public final class WireReader {
      * Reads a 32-bit varint (such as tag or length) and packs {@code (nextPos << 32) | (value & 0xFFFFFFFFL)}.
      */
     public static long readVarint32WithCursor(byte[] buf, int pos, int limit) {
+        if (pos >= limit) throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
         int b = buf[pos++];
         if (b >= 0) {
             return ((long) pos << 32) | (b & 0xFFFFFFFFL);
         }
         int result = b & 0x7F;
+        if (pos >= limit) throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
         if ((b = buf[pos++]) >= 0) {
             result |= b << 7;
             return ((long) pos << 32) | (result & 0xFFFFFFFFL);
         }
         result |= (b & 0x7F) << 7;
+        if (pos >= limit) throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
         if ((b = buf[pos++]) >= 0) {
             result |= b << 14;
             return ((long) pos << 32) | (result & 0xFFFFFFFFL);
         }
         result |= (b & 0x7F) << 14;
+        if (pos >= limit) throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
         if ((b = buf[pos++]) >= 0) {
             result |= b << 21;
             return ((long) pos << 32) | (result & 0xFFFFFFFFL);
         }
         result |= (b & 0x7F) << 21;
+        if (pos >= limit) throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
         b = buf[pos++];
         result |= b << 28;
         if (b < 0) {
             // Negative int32 wire representation uses 10 bytes (sign-extended to 64 bits)
             for (int i = 0; i < 5; i++) {
                 if (pos >= limit) {
-                    throw new IllegalArgumentException("Truncated varint32");
+                    throw new IllegalArgumentException("Truncated varint32 at offset " + pos);
                 }
                 if (buf[pos++] >= 0) {
                     return ((long) pos << 32) | (result & 0xFFFFFFFFL);
                 }
             }
-            throw new IllegalArgumentException("Malformed varint32");
+            throw new IllegalArgumentException("Malformed varint32 at offset " + pos);
         }
         return ((long) pos << 32) | (result & 0xFFFFFFFFL);
     }

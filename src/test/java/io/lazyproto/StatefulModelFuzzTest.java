@@ -1,6 +1,7 @@
 package io.lazyproto;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.UnknownFieldSet;
 import io.lazyproto.dynamic.ProtoDocument;
@@ -12,10 +13,12 @@ import io.lazyproto.model.StandardOrderProto.LineItem;
 import io.lazyproto.model.StandardOrderProto.OrderEnvelope;
 import io.lazyproto.model.StandardOrderProto.UserProfile;
 import io.lazyproto.wire.WireFormat;
+import io.lazyproto.wire.WireReader;
 import io.lazyproto.wire.WireWriter;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -425,7 +428,7 @@ public class StatefulModelFuzzTest {
                                     .setVipLevel(9)
                                     .build().toByteArray();
                             active.heldUserBuilder.mergeFrom(replacement);
-                            active.oracleBuilder.setUser(UserProfile.parseFrom(replacement));
+                            active.oracleBuilder.getUserBuilder().mergeFrom(UserProfile.parseFrom(replacement));
                         } else {
                             active.lazyBuilder.clearItems();
                             OrderEnvelope cur = active.oracleBuilder.build();
@@ -802,9 +805,9 @@ public class StatefulModelFuzzTest {
     }
 
     @Test
-    @DisplayName("Pillar 2B: Stateful Random Model-Checking Fuzzer for Schema-Less ProtoDocument (100 seeds x 30 steps)")
+    @DisplayName("Pillar 2B: Stateful Random Model-Checking Fuzzer for Schema-Less ProtoDocument (200 seeds x 40 steps)")
     void testPillar2B_StatefulRandomModelCheckingFuzzerForProtoDocument() throws IOException {
-        for (int seed = 1; seed <= 100; seed++) {
+        for (int seed = 1; seed <= 200; seed++) {
             Random rng = new Random(seed * 0x517CC1B727220A95L);
             byte[] initialBytes = createSeedOrderBytes(rng, 3);
 
@@ -822,8 +825,8 @@ public class StatefulModelFuzzTest {
             ProtoDocument.Builder activeDoc = rootDoc.toBuilder();
             OrderEnvelope.Builder activeOracle = rootOracle.toBuilder();
 
-            for (int step = 0; step < 30; step++) {
-                int op = rng.nextInt(8);
+            for (int step = 0; step < 40; step++) {
+                int op = rng.nextInt(14);
                 switch (op) {
                     case 0: {
                         long v = INTERESTING_VARINTS[rng.nextInt(INTERESTING_VARINTS.length)];
@@ -879,11 +882,99 @@ public class StatefulModelFuzzTest {
                         oracleSnapshots.add(builtOracle);
                         break;
                     }
+                    case 8: {
+                        // Remove nested field on #5 (user)
+                        boolean had5 = activeDoc.has(5);
+                        assertEquals(activeOracle.hasUser(), had5, "seed=" + seed + ",step=" + step);
+                        if (rng.nextBoolean()) {
+                            activeDoc.at(5).remove(2);
+                            if (had5) activeOracle.getUserBuilder().setCity("");
+                        } else {
+                            activeDoc.at(5).remove(3);
+                            if (had5) activeOracle.getUserBuilder().setVipLevel(0);
+                        }
+                        break;
+                    }
+                    case 9: {
+                        // Remove entire sub-message #5 or re-create via mergeFrom
+                        if (rng.nextBoolean()) {
+                            activeDoc.remove(5);
+                            OrderEnvelope cur = activeOracle.build();
+                            OrderEnvelope.Builder rebuilt = OrderEnvelope.newBuilder()
+                                    .setOrderId(cur.getOrderId())
+                                    .setBuyerName(cur.getBuyerName())
+                                    .setStatus(cur.getStatus())
+                                    .setUpdatedAtFixed64(cur.getUpdatedAtFixed64())
+                                    .setPayload(cur.getPayload())
+                                    .setAuthToken(cur.getAuthToken())
+                                    .setTraceId(cur.getTraceId())
+                                    .setTotalCents(cur.getTotalCents());
+                            for (LineItem item : cur.getItemsList()) rebuilt.addItems(item);
+                            rebuilt.getUnknownFieldsBuilder().mergeFrom(cur.getUnknownFields());
+                            activeOracle = rebuilt;
+                        } else {
+                            UserProfile delta = UserProfile.newBuilder()
+                                    .setUserId(1000L + rng.nextInt(500))
+                                    .setCity(rng.nextBoolean() ? "CD" : "ChengduVeryLongName")
+                                    .setVipLevel(1 + rng.nextInt(300))
+                                    .build();
+                            byte[] deltaBytes = delta.toByteArray();
+                            if (rng.nextBoolean()) {
+                                activeDoc.at(5).mergeFrom(deltaBytes);
+                            } else {
+                                activeDoc.at(5).mergeFrom(ByteString.copyFrom(deltaBytes));
+                            }
+                            activeOracle.getUserBuilder().mergeFrom(delta);
+                        }
+                        break;
+                    }
+                    case 10: {
+                        // Deleting inside non-existent deep dynamic path must stay a no-op
+                        activeDoc.at(199).at(2).remove(3);
+                        assertFalse(activeDoc.has(199), "Absent deep remove must not materialize parent #199");
+                        break;
+                    }
+                    case 11: {
+                        // Cursor clone isolation check
+                        ProtoDocument.Builder subClone = activeDoc.at(5).clone();
+                        String beforeCity = activeDoc.at(5).getString(2);
+                        subClone.setString(2, "ISOLATED_CLONE");
+                        assertEquals(beforeCity, activeDoc.at(5).getString(2));
+                        break;
+                    }
+                    case 12: {
+                        // Reuse builder on a fresh buffer (bounded slice with poison bytes outside)
+                        byte[] nextRaw = createSeedOrderBytes(rng, 2 + rng.nextInt(3));
+                        byte[] padded = new byte[nextRaw.length + 8];
+                        Arrays.fill(padded, (byte) 0x7F);
+                        System.arraycopy(nextRaw, 0, padded, 4, nextRaw.length);
+                        activeDoc.reuse(padded, 4, nextRaw.length);
+                        activeOracle = OrderEnvelope.parseFrom(nextRaw).toBuilder();
+                        break;
+                    }
+                    case 13: {
+                        // Replace int64/scalar back to cleared state
+                        activeDoc.remove(1);
+                        activeOracle.setOrderId(0L);
+                        break;
+                    }
                 }
+                assertEquals(activeOracle.hasUser(), activeDoc.has(5),
+                        "has(5) mismatch at seed=" + seed + ",step=" + step + ",op=" + op);
                 ProtoDocument partial = activeDoc.buildPartial();
                 byte[] out = partial.toByteArray();
-                assertEquals(partial.getSerializedSize(), out.length, "seed=" + seed + ",step=" + step);
-                assertEquals(activeOracle.build(), OrderEnvelope.parseFrom(out), "seed=" + seed + ",step=" + step);
+                assertEquals(partial.getSerializedSize(), out.length, "seed=" + seed + ",step=" + step + ",op=" + op);
+                OrderEnvelope expectedEnv = activeOracle.build();
+                OrderEnvelope actualEnv = OrderEnvelope.parseFrom(out);
+                if (!expectedEnv.equals(actualEnv)) {
+                    fail("seed=" + seed + ",step=" + step + ",op=" + op
+                            + " orderId=(" + expectedEnv.getOrderId() + " vs " + actualEnv.getOrderId() + ")"
+                            + " buyer=(" + expectedEnv.getBuyerName() + " vs " + actualEnv.getBuyerName() + ")"
+                            + " user=(" + expectedEnv.getUser().getUserId() + "/" + expectedEnv.getUser().getCity() + "/" + expectedEnv.getUser().getVipLevel()
+                            + " vs " + actualEnv.getUser().getUserId() + "/" + actualEnv.getUser().getCity() + "/" + actualEnv.getUser().getVipLevel() + ")"
+                            + " items=(" + expectedEnv.getItemsCount() + " vs " + actualEnv.getItemsCount() + ")"
+                            + " unknown=(" + expectedEnv.getUnknownFields() + " vs " + actualEnv.getUnknownFields() + ")");
+                }
             }
 
             for (int i = 0; i < docSnapshots.size(); i++) {
@@ -1107,5 +1198,199 @@ public class StatefulModelFuzzTest {
         assertEquals(0, pb7.getItemsCount());
         assertEquals(oldSize, oldList.size());
         assertEquals(100L, oldList.get(0).getItemId());
+    }
+
+    @Test
+    @DisplayName("Pillar 4D: Architecture v3 Audit & Homologous Edge-Case Matrix")
+    void testPillar4D_AuditHomologousBugMatrix() throws IOException {
+        byte[] raw1 = createSeedOrderBytes(new Random(401), 3);
+        byte[] raw2 = OrderEnvelope.newBuilder()
+                .setOrderId(9090L)
+                .setBuyerName("SliceBuyer")
+                .setStatus(3)
+                .setUser(UserProfile.newBuilder().setUserId(88L).setCity("Hangzhou").setVipLevel(2).build())
+                .addItems(LineItem.newBuilder().setItemId(501L).setSku("SKU-SLICE").setQuantity(4).build())
+                .build().toByteArray();
+
+        // 1. Bounded slice WireReader.readVarint32WithCursor must never leak past limit or throw AIOOBE
+        byte[] truncatedInBigBuf = new byte[] {
+                (byte) 0xFF, (byte) 0xFF, // prefix poison
+                (byte) 0x80,              // slice[2..3): truncated 1-byte varint with continuation bit set!
+                0x05, 0x06, 0x07          // valid bytes right after limit=3 that must NOT be read
+        };
+        assertThrows(IllegalArgumentException.class,
+                () -> WireReader.readVarint32WithCursor(truncatedInBigBuf, 2, 3));
+        byte[] truncatedMultiByte = new byte[] {
+                (byte) 0x81, (byte) 0x82, (byte) 0x83, (byte) 0x01
+        };
+        for (int lim = 0; lim < 4; lim++) {
+            final int limit = lim;
+            assertThrows(IllegalArgumentException.class,
+                    () -> WireReader.readVarint32WithCursor(truncatedMultiByte, 0, limit));
+        }
+        // Also via LazyOrderEnvelope bounded-slice reuse + ProtoDocument.wrapBytes with poison sentinels
+        byte[] truncatedSliceMsg = new byte[] { 0x08, (byte) 0x80, 0x01, 0x02 }; // valid in [0..4), truncated in [0..2)
+        assertThrows(IllegalArgumentException.class,
+                () -> LazyOrderEnvelope.newBuilder().reuse(truncatedSliceMsg, 0, 2).getOrderId());
+        assertThrows(IllegalArgumentException.class,
+                () -> ProtoDocument.wrapBytes(truncatedSliceMsg, 0, 2).getInt64(1));
+
+        // 2. Non-zero offset sub-slice (rawOffset > 0) with poison bytes outside [off, off+len) across FP0/FP1/FP2
+        byte[] poisoned = new byte[raw2.length + 12];
+        Arrays.fill(poisoned, (byte) 0xFE);
+        System.arraycopy(raw2, 0, poisoned, 6, raw2.length);
+        LazyOrderEnvelope.Builder sliceB = LazyOrderEnvelope.newBuilder().reuse(poisoned, 6, raw2.length);
+        assertEquals(OrderEnvelope.parseFrom(raw2), OrderEnvelope.parseFrom(sliceB.build().toByteArray())); // FP0
+        sliceB.setStatus(9); // same-size 1-byte varint -> FP1 on sub-slice
+        LazyOrderEnvelope sliceFp1 = sliceB.build();
+        assertTrue(sliceFp1.isSameSizeDirtyOnly());
+        assertEquals(9, OrderEnvelope.parseFrom(sliceFp1.toByteArray()).getStatus());
+        sliceB.setBuyerName("LongerSliceBuyerName"); // FP2 on sub-slice
+        LazyOrderEnvelope sliceFp2 = sliceB.build();
+        assertFalse(sliceFp2.isSameSizeDirtyOnly());
+        OrderEnvelope decodedSlice = OrderEnvelope.parseFrom(sliceFp2.toByteArray());
+        assertEquals("LongerSliceBuyerName", decodedSlice.getBuyerName());
+        assertEquals(9, decodedSlice.getStatus());
+
+        // 3. CodedInputStream (without explicit pushLimit) + InputStream + delimited IO across all builders
+        CodedInputStream cisOrder = CodedInputStream.newInstance(raw1);
+        LazyOrderEnvelope fromCis = LazyOrderEnvelope.newBuilder().mergeFrom(cisOrder).build();
+        assertEquals(OrderEnvelope.parseFrom(raw1), OrderEnvelope.parseFrom(fromCis.toByteArray()));
+
+        byte[] userBytes = UserProfile.newBuilder().setUserId(55L).setCity("Wuhan").setVipLevel(7).build().toByteArray();
+        LazyUserProfile userFromCis = LazyUserProfile.newBuilder().mergeFrom(CodedInputStream.newInstance(userBytes)).build();
+        assertEquals("Wuhan", userFromCis.getCity());
+
+        ProtoDocument docFromCis = ProtoDocument.newBuilder().mergeFrom(CodedInputStream.newInstance(raw2)).build();
+        assertEquals("Hangzhou", docFromCis.at(5).getString(2));
+        ProtoDocument.Builder docSubCis = ProtoDocument.newBuilder();
+        docSubCis.at(5).mergeFrom(CodedInputStream.newInstance(userBytes));
+        assertEquals("Wuhan", docSubCis.build().at(5).getString(2));
+
+        // InputStream & delimited round-trip
+        LazyOrderEnvelope fromStream = LazyOrderEnvelope.newBuilder()
+                .mergeFrom(new ByteArrayInputStream(raw1))
+                .build();
+        assertEquals(OrderEnvelope.parseFrom(raw1), OrderEnvelope.parseFrom(fromStream.toByteArray()));
+
+        ByteArrayOutputStream delimOut = new ByteArrayOutputStream();
+        fromStream.writeDelimitedTo(delimOut);
+        fromCis.toBuilder().setStatus(77).build().writeDelimitedTo(delimOut);
+        ByteArrayInputStream delimIn = new ByteArrayInputStream(delimOut.toByteArray());
+        LazyOrderEnvelope.Builder d1 = LazyOrderEnvelope.newBuilder();
+        assertTrue(d1.mergeDelimitedFrom(delimIn));
+        LazyOrderEnvelope.Builder d2 = LazyOrderEnvelope.newBuilder();
+        assertTrue(d2.mergeDelimitedFrom(delimIn));
+        assertFalse(LazyOrderEnvelope.newBuilder().mergeDelimitedFrom(delimIn));
+        assertEquals(OrderEnvelope.parseFrom(raw1), OrderEnvelope.parseFrom(d1.build().toByteArray()));
+        assertEquals(77, d2.build().getStatus());
+
+        // 4. ProtoDocument: deleting sub-fields under absent nested path vs existing sub-message + reuse(nested)
+        ProtoDocument.Builder dbAbsent = ProtoDocument.newBuilder();
+        dbAbsent.at(1).at(2).remove(3);
+        assertFalse(dbAbsent.has(1), "Removing field inside absent nested path must keep parent absent");
+        ProtoDocument builtAbsent = dbAbsent.build();
+        assertFalse(builtAbsent.has(1));
+        assertEquals(0, builtAbsent.getSerializedSize());
+        assertEquals(0, builtAbsent.toByteArray().length);
+
+        // Removing a field inside an ALREADY EXISTING empty/non-empty submessage #5 preserves presence #5
+        ProtoDocument.Builder dbExisting = ProtoDocument.wrapBytes(
+                OrderEnvelope.newBuilder().setUser(UserProfile.newBuilder().setUserId(1L).build()).build().toByteArray()
+        ).toBuilder();
+        assertTrue(dbExisting.has(5));
+        dbExisting.at(5).remove(1);
+        assertTrue(dbExisting.has(5));
+        ProtoDocument builtExisting = dbExisting.build();
+        assertTrue(builtExisting.has(5));
+        assertTrue(OrderEnvelope.parseFrom(builtExisting.toByteArray()).hasUser());
+
+        // Wire-type collision replacement on ProtoDocument: VARINT #5 -> submessage #5, and submessage #5 -> string #5
+        byte[] varintField5 = new byte[] { (5 << 3), 42 };
+        ProtoDocument.Builder dbReplaceVarint = ProtoDocument.wrapBytes(varintField5).toBuilder();
+        dbReplaceVarint.at(5).setInt32(1, 99);
+        assertEquals(99, OrderEnvelope.parseFrom(dbReplaceVarint.build().toByteArray()).getUser().getUserId());
+
+        ProtoDocument.Builder dbReplaceSub = ProtoDocument.wrapBytes(raw2).toBuilder();
+        dbReplaceSub.setString(5, "override-5");
+        assertEquals("override-5", dbReplaceSub.build().getString(5));
+        assertEquals("override-5", UnknownFieldSet.parseFrom(dbReplaceSub.build().toByteArray())
+                .getField(5).getLengthDelimitedList().get(0).toStringUtf8());
+
+        // Sequential reuse() on ProtoDocument.Builder with nested at(5) reads/writes
+        ProtoDocument.Builder docReuse = ProtoDocument.newBuilder();
+        docReuse.reuse(raw1);
+        assertEquals("Shanghai", docReuse.at(5).getString(2));
+        docReuse.at(5).setString(2, "TempEdit");
+        assertEquals("TempEdit", docReuse.at(5).getString(2));
+        docReuse.reuse(raw2);
+        assertEquals("Hangzhou", docReuse.at(5).getString(2));
+        assertEquals(2, docReuse.at(5).getInt32(3));
+
+        // 5. Var-size -> Same-size FP1 recovery & mixed ItemsOverlay lifecycle stress
+        LazyOrderEnvelope.Builder pbFpRecovery = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        pbFpRecovery.setStatus(50000);
+        assertFalse(pbFpRecovery.build().isSameSizeDirtyOnly());
+        pbFpRecovery.setStatus(2); // back to original 1-byte varint width!
+        LazyOrderEnvelope recovered = pbFpRecovery.build();
+        assertEquals(2, recovered.getStatus());
+        assertEquals(2, OrderEnvelope.parseFrom(recovered.toByteArray()).getStatus());
+
+        LazyOrderEnvelope.Builder pbMix = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        LazyLineItem extItem = LazyLineItem.newBuilder().setItemId(777L).setSku("MIX-777").setQuantity(3).build();
+        pbMix.setItems(0, extItem);
+        pbMix.getItemsBuilder(0).setQuantity(8);
+        List<LazyLineItem> beforeClear = pbMix.getItemsList();
+        assertEquals(8, beforeClear.get(0).getQuantity());
+        pbMix.clearItems();
+        assertEquals(8, beforeClear.get(0).getQuantity());
+        assertEquals(0, pbMix.getItemsCount());
+        pbMix.addItems(extItem);
+        pbMix.getItemsBuilder(0).setQuantity(11);
+        assertEquals(11, pbMix.build().getItems(0).getQuantity());
+        assertEquals("MIX-777", OrderEnvelope.parseFrom(pbMix.build().toByteArray()).getItems(0).getSku());
+
+        // Bound child builder mergeFrom(Message) (preserves unmentioned fields!) & build() isolation across parent reuse()
+        LazyOrderEnvelope.Builder pbMergeChild = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        long origUserId = pbMergeChild.getUser().getUserId();
+        long origItemId = pbMergeChild.getItems(0).getItemId();
+        LazyLineItem.Builder child0 = pbMergeChild.getItemsBuilder(0);
+        LazyLineItem child0Snap = child0.build();
+        pbMergeChild.getUserBuilder().mergeFrom(LazyUserProfile.newBuilder().setCity("Tianjin").build());
+        child0.mergeFrom(LazyLineItem.newBuilder().setSku("MERGED-SKU").build());
+        assertEquals("SKU-100", child0Snap.getSku());
+        assertEquals("MERGED-SKU", pbMergeChild.build().getItems(0).getSku());
+        assertEquals(origItemId, pbMergeChild.build().getItems(0).getItemId());
+        assertEquals("Tianjin", pbMergeChild.build().getUser().getCity());
+        assertEquals(origUserId, pbMergeChild.build().getUser().getUserId());
+        pbMergeChild.reuse(raw2);
+        assertEquals("SKU-SLICE", pbMergeChild.getItems(0).getSku());
+        assertEquals("SKU-100", child0Snap.getSku());
+
+        // Top-level & dynamic cursor mergeFrom preserves unmentioned fields too
+        LazyOrderEnvelope.Builder topMerge = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        topMerge.mergeFrom(LazyOrderEnvelope.newBuilder().setStatus(42).build());
+        assertEquals(42, topMerge.getStatus());
+        assertEquals("Shanghai", topMerge.getUser().getCity());
+        assertSame(LazyOrderEnvelope.EMPTY, pbMergeChild.getDefaultInstanceForType());
+        topMerge.mergeFrom(LazyOrderEnvelope.newBuilder().setBuyerName("MergedBuyer").build().toByteArray());
+        assertEquals(42, topMerge.getStatus());
+        assertEquals("MergedBuyer", topMerge.getBuyerName());
+        assertEquals("Shanghai", OrderEnvelope.parseFrom(topMerge.build().toByteArray()).getUser().getCity());
+
+        ProtoDocument.Builder docMerge = ProtoDocument.wrapBytes(raw1).toBuilder();
+        docMerge.at(5).mergeFrom(UserProfile.newBuilder().setCity("Suzhou").build().toByteArray());
+        assertEquals("Suzhou", docMerge.at(5).getString(2));
+        assertEquals(origUserId, docMerge.at(5).getInt64(1));
+        assertEquals("Shanghai", OrderEnvelope.parseFrom(raw1).getUser().getCity());
+
+        // Removing a child field inside an explicitly deleted parent sub-message keeps parent deleted
+        ProtoDocument.Builder dbDelParent = ProtoDocument.wrapBytes(raw1).toBuilder();
+        dbDelParent.remove(5);
+        assertFalse(dbDelParent.has(5));
+        dbDelParent.at(5).remove(2);
+        assertFalse(dbDelParent.has(5));
+        assertFalse(OrderEnvelope.parseFrom(dbDelParent.build().toByteArray()).hasUser());
+        assertSame(LazyOrderEnvelope.EMPTY, pbMergeChild.getDefaultInstanceForType());
     }
 }
