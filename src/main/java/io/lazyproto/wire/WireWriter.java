@@ -7,12 +7,18 @@ import java.nio.charset.StandardCharsets;
  * and branchless varint size calculation.
  */
 public final class WireWriter {
-    private final byte[] out;
+    private byte[] out;
     private int pos;
 
     public WireWriter(byte[] out, int startPos) {
         this.out = out;
         this.pos = startPos;
+    }
+
+    public WireWriter reset(byte[] out, int startPos) {
+        this.out = out;
+        this.pos = startPos;
+        return this;
     }
 
     public byte[] buffer() {

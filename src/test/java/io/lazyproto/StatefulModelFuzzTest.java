@@ -202,8 +202,9 @@ public class StatefulModelFuzzTest {
 
             for (int step = 0; step < stepsPerSeed; step++) {
                 String ctx = "seed=" + seed + ",step=" + step;
-                ActiveBuilderState active = builders.get(rng.nextInt(builders.size()));
-                int action = rng.nextInt(16);
+                int activeIdx = rng.nextInt(builders.size());
+                ActiveBuilderState active = builders.get(activeIdx);
+                int action = rng.nextInt(17);
 
                 switch (action) {
                     case 0: {
@@ -380,8 +381,15 @@ public class StatefulModelFuzzTest {
                         break;
                     }
                     case 14: {
-                        // Clone an active builder via clone()
-                        if (builders.size() < 8) {
+                        // Clone an active builder via clone() (or clone bound child builder!)
+                        if (active.heldUserBuilder != null && rng.nextBoolean()) {
+                            LazyUserProfile.Builder clonedUser = active.heldUserBuilder.clone();
+                            assertEquals(active.oracleBuilder.getUser().getCity(), clonedUser.getCity(), ctx);
+                            clonedUser.setCity("DETACHED_CLONE_CITY");
+                            // Mutating detached clone must NOT affect parent builder!
+                            assertEquals(active.oracleBuilder.getUser().getCity(),
+                                    active.lazyBuilder.getUser().getCity(), ctx);
+                        } else if (builders.size() < 8) {
                             builders.add(new ActiveBuilderState(
                                     active.lazyBuilder.clone(),
                                     active.oracleBuilder.build().toBuilder()));
@@ -389,11 +397,52 @@ public class StatefulModelFuzzTest {
                         break;
                     }
                     case 15: {
-                        // Build a snapshot, verify against Oracle, and keep builder active for post-build mutations!
+                        // Build a snapshot (and also occasionally build heldUserBuilder independently!)
+                        if (active.heldUserBuilder != null && rng.nextInt(4) == 0) {
+                            LazyUserProfile uSnap = active.heldUserBuilder.build();
+                            String expCity = active.oracleBuilder.getUser().getCity();
+                            assertEquals(expCity, uSnap.getCity(), ctx);
+                            active.heldUserBuilder.setCity("POST_CHILD_BUILD_" + step);
+                            active.oracleBuilder.getUserBuilder().setCity("POST_CHILD_BUILD_" + step);
+                            assertEquals(expCity, uSnap.getCity(), ctx + ": child snapshot corrupted after build()");
+                        }
                         LazyOrderEnvelope builtLazy = active.lazyBuilder.build();
                         OrderEnvelope builtOracle = active.oracleBuilder.build();
                         assertDifferentialOracleEquivalence(builtLazy, builtOracle, ctx + ":build");
                         snapshots.add(new SnapshotState(builtLazy, builtOracle, ctx));
+                        break;
+                    }
+                    case 16: {
+                        // Bound child builder clear() / mergeFrom() or clearItems() (Issue #2 regressions!)
+                        int subOp = rng.nextInt(3);
+                        if (subOp == 0 && active.heldUserBuilder != null) {
+                            active.heldUserBuilder.clear();
+                            active.oracleBuilder.setUser(UserProfile.getDefaultInstance());
+                        } else if (subOp == 1 && active.heldUserBuilder != null) {
+                            byte[] replacement = UserProfile.newBuilder()
+                                    .setUserId(1234L + step)
+                                    .setCity("MergedUser-" + step)
+                                    .setVipLevel(9)
+                                    .build().toByteArray();
+                            active.heldUserBuilder.mergeFrom(replacement);
+                            active.oracleBuilder.setUser(UserProfile.parseFrom(replacement));
+                        } else {
+                            active.lazyBuilder.clearItems();
+                            OrderEnvelope cur = active.oracleBuilder.build();
+                            OrderEnvelope.Builder nb = OrderEnvelope.newBuilder()
+                                    .setOrderId(cur.getOrderId())
+                                    .setBuyerName(cur.getBuyerName())
+                                    .setStatus(cur.getStatus())
+                                    .setUpdatedAtFixed64(cur.getUpdatedAtFixed64())
+                                    .setPayload(cur.getPayload())
+                                    .setAuthToken(cur.getAuthToken())
+                                    .setTraceId(cur.getTraceId())
+                                    .setTotalCents(cur.getTotalCents());
+                            if (cur.hasUser()) nb.setUser(cur.getUser());
+                            nb.getUnknownFieldsBuilder().mergeFrom(cur.getUnknownFields());
+                            active = new ActiveBuilderState(active.lazyBuilder, nb);
+                            builders.set(activeIdx, active);
+                        }
                         break;
                     }
                 }
@@ -556,6 +605,7 @@ public class StatefulModelFuzzTest {
         ProtoDocument mutated = doc.toBuilder().setInt32(3, 99).build();
         UnknownFieldSet parsed = UnknownFieldSet.parseFrom(mutated.toByteArray());
         assertEquals(List.of(99L), parsed.getField(3).getVarintList());
+        assertEquals(100L, parsed.getField(50).getVarintList().get(0));
         assertEquals(List.of(100L, 200L, 300L), parsed.getField(50).getVarintList());
     }
 
@@ -842,5 +892,117 @@ public class StatefulModelFuzzTest {
                 assertEquals(oracleSnapshots.get(i), OrderEnvelope.parseFrom(docSnapshots.get(i).toByteArray()));
             }
         }
+    }
+
+    @Test
+    @DisplayName("Pillar 4B: GitHub Issue #2 Round-2 Regression Matrix (All 8 Findings Covered)")
+    void testPillar4B_Issue2RegressionMatrix() throws IOException {
+        byte[] raw = createSeedOrderBytes(new Random(777), 3);
+
+        // #1: Child builder clear() and mergeFrom() after parent build() must isolate parent snapshot
+        LazyOrderEnvelope.Builder pb1 = LazyOrderEnvelope.parseFrom(raw).toBuilder();
+        LazyUserProfile.Builder ub1 = pb1.getUserBuilder();
+        LazyOrderEnvelope pSnap1 = pb1.build();
+        byte[] pSnap1Bytes = pSnap1.toByteArray();
+        String origCity = pSnap1.getUser().getCity();
+        ub1.clear();
+        assertEquals(origCity, pSnap1.getUser().getCity());
+        assertArrayEquals(pSnap1Bytes, pSnap1.toByteArray());
+        assertFalse(pb1.hasUser());
+        assertFalse(pb1.build().hasUser());
+
+        byte[] bjBytes = UserProfile.newBuilder().setUserId(99L).setCity("BJ").build().toByteArray();
+        ub1.mergeFrom(bjBytes);
+        assertEquals(origCity, pSnap1.getUser().getCity());
+        assertArrayEquals(pSnap1Bytes, pSnap1.toByteArray());
+        assertEquals("BJ", pb1.build().getUser().getCity());
+
+        // #2: Bound child builder build() followed by post-build setter must NOT mutate built child snapshot
+        LazyOrderEnvelope.Builder pb2 = LazyOrderEnvelope.parseFrom(raw).toBuilder();
+        LazyUserProfile.Builder ub2 = pb2.getUserBuilder();
+        ub2.setCity("SNAP_CITY");
+        LazyUserProfile userSnap = ub2.build();
+        ub2.setCity("HACKED_AFTER_BUILD");
+        pb2.getUserBuilder().setCity("HACKED_VIA_PARENT");
+        assertEquals("SNAP_CITY", userSnap.getCity());
+        assertEquals("HACKED_VIA_PARENT", pb2.build().getUser().getCity());
+
+        // #3: builder.getUser() & doc.at() are strictly immutable snapshots / non-leaking views
+        LazyOrderEnvelope.Builder pb3 = LazyOrderEnvelope.parseFrom(raw).toBuilder();
+        LazyUserProfile immutableUserView = pb3.getUser();
+        LazyOrderEnvelope pSnap3 = pb3.build();
+        pb3.getUserBuilder().setCity("MUTATED_LATER");
+        assertEquals("Shanghai", immutableUserView.getCity());
+        assertEquals("Shanghai", pSnap3.getUser().getCity());
+
+        ProtoDocument.Builder db3 = ProtoDocument.wrapBytes(raw).toBuilder();
+        ProtoDocument.Builder subCursor = db3.at(5);
+        ProtoDocument docSnap3 = db3.build();
+        subCursor.setString(2, "POST_BUILD_SUB_CURSOR");
+        assertEquals("Shanghai", docSnap3.at(5).getString(2));
+        assertEquals("POST_BUILD_SUB_CURSOR", db3.build().at(5).getString(2));
+
+        // #4: Bound child builder clone() after parent fork sees latest parent state and stays detached
+        LazyOrderEnvelope.Builder pb4 = LazyOrderEnvelope.parseFrom(raw).toBuilder();
+        LazyUserProfile.Builder ub4 = pb4.getUserBuilder();
+        ub4.setCity("V1");
+        LazyOrderEnvelope snap4 = pb4.build();
+        pb4.getUserBuilder().setCity("V2");
+        LazyUserProfile.Builder clonedUb = ub4.clone();
+        assertEquals("V2", clonedUb.getCity());
+        assertEquals("V1", snap4.getUser().getCity());
+        clonedUb.setCity("V3_CLONED");
+        assertEquals("V2", pb4.getUser().getCity());
+        assertEquals("V3_CLONED", clonedUb.build().getCity());
+
+        // #5: ProtoDocument.at() on appended LENGTH_DELIMITED field preserves payload & size
+        ProtoDocument.Builder db5 = ProtoDocument.newBuilder();
+        db5.setString(2, "Hello");
+        ProtoDocument doc5 = db5.build();
+        assertEquals(7, doc5.getSerializedSize());
+        assertEquals(ByteString.copyFromUtf8("Hello"), ByteString.copyFrom(doc5.at(2).rawBuffer(), doc5.at(2).rawOffset(), doc5.at(2).rawLength()));
+        byte[] out5 = doc5.toByteArray();
+        assertEquals("Hello", OrderEnvelope.parseFrom(out5).getBuyerName());
+
+        // And navigating into appended valid submessage bytes on field #5 preserves and fuses subfields cleanly
+        ProtoDocument.Builder db5Sub = ProtoDocument.newBuilder();
+        byte[] validUserBytes = UserProfile.newBuilder().setUserId(42L).setCity("SZ").build().toByteArray();
+        db5Sub.setString(5, new String(validUserBytes, StandardCharsets.ISO_8859_1));
+        ProtoDocument doc5Sub = db5Sub.build();
+        assertEquals(42L, doc5Sub.at(5).getInt64(1));
+        assertArrayEquals(doc5Sub.toByteArray(), doc5Sub.toByteArray());
+
+        // #6: Read-only navigation on missing paths at(1).at(2) NEVER mutates presence or output
+        ProtoDocument emptyDoc = ProtoDocument.newBuilder().build();
+        assertSame(ProtoDocument.EMPTY, emptyDoc.at(1).at(2));
+        assertFalse(emptyDoc.has(1));
+
+        ProtoDocument.Builder db6 = ProtoDocument.newBuilder();
+        assertEquals(0, db6.at(1).at(2).getInt32(3));
+        assertFalse(db6.has(1));
+        db6.setInt32(99, 7);
+        UnknownFieldSet ufs6 = UnknownFieldSet.parseFrom(db6.build().toByteArray());
+        assertFalse(ufs6.hasField(1), "Unwritten path at(1).at(2) must not emit empty submessage");
+        assertEquals(List.of(7L), ufs6.getField(99).getVarintList());
+
+        // And writing on deep at(1).at(2).setInt32(3, 42) lazily materializes when written!
+        db6.at(1).at(2).setInt32(3, 42);
+        assertTrue(db6.has(1));
+        assertEquals(42, db6.build().at(1).at(2).getInt32(3));
+
+        // #7: clearItems() leaves previously returned immutable LazyLineItem untouched & throws OOB on old itemBuilder
+        LazyOrderEnvelope.Builder pb7 = LazyOrderEnvelope.parseFrom(raw).toBuilder();
+        LazyLineItem oldItem = pb7.getItems(0);
+        LazyLineItem.Builder oldItemBuilder = pb7.getItemsBuilder(0);
+        pb7.clearItems();
+        assertEquals(100L, oldItem.getItemId());
+        assertThrows(IndexOutOfBoundsException.class, () -> oldItemBuilder.setQuantity(777));
+        assertEquals(0, pb7.build().getItemsCount());
+
+        // #8: Builder.getDefaultInstanceForType() returns empty default instance, never current populated copy
+        assertEquals(0L, ((LazyOrderEnvelope) pb1.getDefaultInstanceForType()).getOrderId());
+        assertEquals("", ((LazyOrderEnvelope) pb1.getDefaultInstanceForType()).getBuyerName());
+        assertEquals(0L, ((LazyUserProfile) ub1.getDefaultInstanceForType()).getUserId());
+        assertSame(ProtoDocument.EMPTY, db3.getDefaultInstanceForType());
     }
 }

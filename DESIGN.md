@@ -16,8 +16,8 @@
 6. [复用输入的序列化引擎：四级加速路径与算法伪代码](#6-复用输入的序列化引擎四级加速路径与算法伪代码)
 7. [全过程字节级推演示例（Byte-by-Byte Walkthrough）](#7-全过程字节级推演示例byte-by-byte-walkthrough)
 8. [不同编程语言对性能的影响与针对性架构设计（C++ / Rust / Go / Java）](#8-不同编程语言对性能的影响与针对性架构设计c--rust--go--java)
-9. [Java 版 Architecture v2：只读视图与可变 Builder 分离架构（受控异常裁剪方案）](#9-java-版-architecture-v2只读视图与可变-builder-分离架构受控异常裁剪方案)
-10. [关键边界、显式槽位状态机与 Protobuf Wire 语义契约](#10-关键边界显式槽位状态机与-protobuf-wire-语义契约)
+9. [Java 版 Architecture v3：不可变原始底座 + 外挂 COW Overlay 融合架构](#9-java-版-architecture-v3不可变原始底座--外挂-cow-overlay-融合架构)
+10. [关键边界、外挂状态机与 Protobuf Wire 语义契约](#10-关键边界外挂状态机与-protobuf-wire-语义契约)
 11. [六维验证体系设计（Differential Oracle + 状态机 Fuzzing + 畸形流语料 + 白盒路径断言）](#11-六维验证体系设计differential-oracle--状态机-fuzzing--畸形流语料--白盒路径断言)
 12. [模块划分与实测基准报告](#12-模块划分与实测基准报告)
 
@@ -499,117 +499,106 @@ Java 是从 `lazy-proto` 架构中**获益幅度最大**（相比官方 `protobu
 
 ---
 
-## 9. Java 版 Architecture v2：只读视图与可变 Builder 分离架构（受控异常裁剪方案）
+## 9. Java 版 Architecture v3：不可变原始底座 + 外挂 COW Overlay 融合架构
 
-在第一代设计（Design v1）的工程实践中，我们发现：**试图将 `Message` 与 `Builder` 强行合并为同一个对外可变的对象，并在子对象上通过单 `parent` 指针向上冒泡，会与 Java Protobuf 的不可变值语义（Immutable Snapshot Semantics）产生四大结构性矛盾**：
-1. **`build()` 快照失真**：若 `Message` 自身暴露 `setXxx()` 或 `msg.getUser()` 返回可变对象，调用方在 `build()` 之后继续修改同一 `Builder`（或通过 `msg.getUser().setCity()` 修改子视图），会直接篡改已构建完成的 `Message` 快照。
-2. **“子对象自身是否 Clean”与“父槽位是否被替换”概念混淆**：当调用 `builder.setUser(LazyUserProfile.parseFrom(otherBytes))` 传入一个外部干净子对象时，该子对象相对于自己的 `otherBytes` 是 `isClean() == true`，但相对于父消息的 `buf` 却是**外来替换物**。用 `!child.isClean()` 判断父槽位是否需要在 `toBuilder()` 时复制，会导致外来干净子对象在 fork 时丢失或触发 NPE。
-3. **跨层尺寸缓存 (`cachedSerializedSize`) 失效脆弱性**：当同一个对象既能被读取缓存尺寸、又能被原地反复修改甚至“恢复回原干净子对象”时，任何一条未向上冒泡的路径都会导致父层 `cachedSerializedSize` 陈旧，引发尾部零字节填充或 `ArrayIndexOutOfBoundsException`。
-4. **有 Schema 与无 Schema (`ProtoDocument`) 扫描期语义混同**：在无 Schema 的 `ProtoDocument` 中，扫描期无法区分重复出现的 Tag 是单值覆盖（Last-Write-Wins）、单值子消息分段合并（Merge）还是 `unpacked repeated` 列表，扫描期提前做 `SHADOWED` 标记会导致 `unpacked repeated` 元素被误删。
+在经历了前两代架构演进与两轮严格复核（[GitHub Issue #1](https://github.com/inu4g0t/lazy-proto/issues/1) 与 [Issue #2](https://github.com/inu4g0t/lazy-proto/issues/2)）后，我们洞察到一条核心定律：
 
-为此，**Architecture v2** 对 Java 版进行了彻底的职责解耦与状态机重构。
+> **只要“写状态”还原地侵入在“原始数据索引 (`FieldTape`)”内部，不可变值语义、`build()` 快照隔离、子 `Builder` 独立构建、只读导航与并发共享之间就会持续产生结构性冲突。**
+
+为此，**Architecture v3** 将 Java 运行时彻底重构为 **“不可变原始底座（`ImmutableWireBase`） + 外挂写增量层（External COW `WireOverlay`） + 读/序列化按需融合引擎（`WireMergeEngine`）”** 的三元分离模型：
 
 ---
 
-### 9.1 核心架构重构：只读 `LazyMessage` 视图 + 独占修改权的 `Builder`
+### 9.1 三元分离模型（Immutable Base + External Overlay + Merge Engine）
 
 ```mermaid
-classDiagram
-    class OrderOrBuilder {
-        <<interface>>
-        +getOrderId() long
-        +getBuyerName() String
-        +getBuyerNameBytes() ByteString
-        +getUser() LazyUserProfile
-        +getUserOrBuilder() UserProfileOrBuilder
-        +getItemsList() List~LazyLineItem~
-    }
-    class LazyOrderEnvelope {
-        <<Read-Only Lazy View (Implements Message)>>
-        -byte[] buf
-        -long[] tape
-        -long decodedMask
-        -int cachedSerializedSize
-        +parseFrom(byte[]) LazyOrderEnvelope
-        +getOrderId() long
-        +getUser() LazyUserProfile
-        +getItems(int) LazyLineItem
-        +toBuilder() Builder
-        +toByteArray() byte[]
-        +getSerializedSize() int
-    }
-    class Builder["LazyOrderEnvelope.Builder"] {
-        <<Mutable State Machine (Implements Message.Builder)>>
-        -LazyOrderEnvelope target
-        -boolean built
-        -byte[] slotStates
-        +setStatus(int) Builder
-        +getUserBuilder() LazyUserProfile.Builder
-        +setUser(LazyUserProfile) Builder
-        +getItemsBuilder(int) LazyLineItem.Builder
-        +build() LazyOrderEnvelope
-        +clone() Builder
-    }
+flowchart LR
+    subgraph Base["Layer A: ImmutableWireBase (只读底座)"]
+        Buf["byte[] buf (永不修改)"]
+        Tape["128-bit Read-Only Tape (KIND_SCALAR_SLOT / REPEATED_ITEM / SPLIT_SUB / SHADOWED)"]
+        Cache["frozen=true 后终身不可变，多快照/多Builder/多线程零拷贝共享"]
+    end
 
-    OrderOrBuilder <|.. LazyOrderEnvelope
-    OrderOrBuilder <|.. Builder
-    LazyOrderEnvelope --> Builder : toBuilder() (Shallow Tape Fork)
-    Builder --> LazyOrderEnvelope : build() (Ownership Transfer + Freeze)
+    subgraph Overlay["Layer B: External WireOverlay (外挂写增量)"]
+        Scalar["writtenMask / sameSizeMask / varSizeMask / deletedMask"]
+        UserOv["UserOverlay (INHERIT_BASE | DELETED | PATCHED | REPLACED)"]
+        ItemsOv["ItemsOverlay (cleared + 稀疏 dirtySlots + appendedSlots)"]
+        Freeze["Transient-to-Persistent: build() 仅置 frozen=true，写时 COW"]
+    end
+
+    subgraph Merge["Layer C: WireMergeEngine (读/序列化按需融合)"]
+        Read["Read Merge: 先查 Overlay 位掩码 -> 未命中读 Base"]
+        FP0["FP0: overlay==null -> 整块 arraycopy"]
+        FP1["FP1: sameSizeOnly -> 拷 Base 到 out[] 后按 Base 偏移覆盖输出数组"]
+        FP2["FP2/3: 线性扫只读 Tape + O(1) 位测试合并连续 span"]
+    end
+
+    Base --> Merge
+    Overlay --> Merge
 ```
 
-#### Architecture v2 的四条铁律：
+#### Architecture v3 的五条架构铁律：
 
-1. **`LazyMessage` 对外严格只读（Immutable Snapshot Contract）**：
-   - `LazyOrderEnvelope`、`LazyUserProfile`、`LazyLineItem` 实现 `com.google.protobuf.Message` 与对应的 `XxxOrBuilder`；
-   - **公开 API 仅提供 Getter 与序列化方法，不暴露公开的 `setXxx()` / `clearXxx()`**（所有内部状态变更方法均为包级私有或仅由 `Builder` 驱动）。
-   - `msg.getUser()` 返回只读的 `LazyUserProfile`；`msg.getItems(i)` 返回只读的 `LazyLineItem`。
-   - **架构收益**：
-     - 一旦 `LazyMessage` 构建完成（无论是 `parseFrom` 还是 `builder.build()`），其逻辑值永不改变，`cachedSerializedSize` 计算一次后**终身有效，永不失效**！
-     - 任意只读 `LazyUserProfile` 实例可以被多个 `OrderEnvelope.Builder` 通过 `b1.setUser(u); b2.setUser(u);` **零拷贝安全共享（DAG Sharing）**，无需克隆 `u`，更无需修改 `u.parent` 指针！
-2. **`Builder` 独占修改权 + 所有权转移（Ownership Transfer & Copy-on-Post-Build-Write）**：
-   - 所有修改必须通过 `Builder`（`order.toBuilder()` 或 `Order.newBuilder()`）进行：
-     - `builder.setStatus(2)`
-     - `builder.getUserBuilder().setCity("BJ")`
-     - `builder.setUser(externalUser)`
-     - `builder.getItemsBuilder(42).setQuantity(999)`
-   - **正常路径零额外拷贝**：当调用 `LazyOrderEnvelope m1 = builder.build()` 时，`builder` 将 `this.built = true` 置位（并递归冻结所有已打开的子 `Builder`），直接将内部持有的 `LazyOrderEnvelope` 引用返回给 `m1`（**0 额外拷贝**）。
-   - **Build 后二次修改自动写时拷贝（Copy-on-Post-Build-Write）**：若调用方在 `m1 = builder.build()` 之后**继续修改同一个 `builder` 或之前持有的 `userBuilder`**，`ensureMutable()` 检测到 `built == true`，立即在后台浅拷贝出一份新的 `LazyOrderEnvelope`（并重绑子 `Builder`），确保已发布的 `m1` **100% 物理隔离、绝不被污染**！
-3. **保留显式零分配热路径（Reusable In-Place Mutator / `toInPlaceBuilder()`）**：
-   - 针对追求极致 `0 Bytes/op` 的流式网关热路径（调用方明确知晓当前消息为单线程独占且无需保留旧快照），提供显式 `reusableMsg.wrap(bytes)` + 原地修改接口，在文档与基准测试中与默认隔离模式（`toBuilder()`）严格分列口径。
+1. **原始数据底座彻底只读且零拷贝共享（`ImmutableWireBase`）**：
+   - `ImmutableWireBase` 仅记录原始 `byte[]` 切片与 Tier-1 惰性扫描出的不可变 `TapeEntry`（`word1` 固化条目种类 `KIND_UNKNOWN`、`KIND_SHADOWED`、`KIND_SCALAR_SLOT(slot)`、`KIND_SPLIT_SUB_CONT`、`KIND_SPLIT_SUB_TAIL`、`KIND_REPEATED_ITEM(ordinal)`），**没有任何写标志位，也没有任何 `parent` 回指**。
+   - 当调用 `toBuilder()` / `clone()` 时，新旧 `Builder` 直接共享同一份已冻结的 `ImmutableWireBase` 指针——**不再拷贝 `long[] tape` 或 `slotTapeIdx[]`**。
+2. **`Message` 对外 100% 严格不可变（Elimination of Mutable Child Leaks）**：
+   - `LazyOrderEnvelope`、`LazyUserProfile`、`LazyLineItem`、`ProtoDocument` 只持有不可变的 `(frozen Base, @Nullable frozen Overlay)`，**彻底移除所有 `public set*()` / `clear*()` / `wrap*()`**。
+   - `builder.getUser()`、`builder.getItems(i)`、`doc.at(fn)` 一律返回不可变快照或空哨兵 `EMPTY`，外部拿到任何子视图引用都绝不可能篡改父快照。
+   - 由于 `Message` 不可变，`getUser(extUser)` / `setItems(i, extItem)` **无需防御性拷贝**即可直接跨多棵树零拷贝 DAG 共享。
+3. **绑定子 Builder 作为无状态游标 + `frozen` COW 写时分叉**：
+   - `LazyUserProfile.Builder`、`LazyLineItem.Builder` 与 `ProtoDocument.Builder.at(fn)` 在绑定父 `Builder` 时**不私藏自己的 `impl`/`built` 副本**；
+   - 其 `get*`、`set*`、`clear()`、`mergeFrom()`、`build()`、`clone()` 全部动态经由父 `Builder` 的 `resolveReadBase()`、`resolveReadOverlay()` 与 `ensureMutableOverlay()` 执行；
+   - 无论先父 `build()` 再改子 Builder，还是先子 `build()` 再改子/父 Builder，只要目标 `Overlay.frozen == true` 即触发写时复制（COW），历史快照 100% 隔离。
+4. **`ProtoDocument` 只读导航零副作用 & 写入延迟物化**：
+   - 不可变 `ProtoDocument.at(fn)` 遇到缺失字段直接返回单例 `ProtoDocument.EMPTY`；遇到已写入的 `appendedBytes` 直接将其包装为只读子文档视图；
+   - `ProtoDocument.Builder.at(fn)` 返回延迟物化的游标 `Builder`，**连续导航 `at(1).at(2)` 只要未调用 `set*`/`remove`，绝不向父节点登记槽位，不改变 `has()` 与序列化输出**。
+5. **显式无分配复用热路径（`Builder.reuse(byte[])`）**：
+   - 对吞吐极致敏感的流式场景，复用线程局部 `Builder` 并调用 `builder.reuse(bytes)`：只要前轮未调用 `build()` 冻结底层实例，即可复用同一组 `ImmutableWireBase` 与 `WireOverlay` 数组，实现 **`0 Bytes/op` 堆分配**；一旦调用过 `build()`，下轮 `reuse()` 自动检测 `isFrozen()` 并分配新实例，安全与性能兼得。
 
 ---
 
-## 10. 关键边界、显式槽位状态机与 Protobuf Wire 语义契约
+### 9.2 类职责映射（`io.lazyproto.runtime` / `model` / `dynamic`）
 
-### 10.1 显式父槽位状态机（Explicit Parent Slot State Machine）
+| 核心类 | 所属职责层 | 关键不变式 |
+| :--- | :--- | :--- |
+| `ImmutableWireBase` | Layer A（底座） | 双检查线程安全惰性 `ensureScanned()`；`frozen == true` 后拒绝任何 `resetForReuse()` |
+| `WireOverlay` | Layer B（外挂） | 保存 `sameSizeMask` / `varSizeMask` / `deletedMask` / `appendedMask` 与稀疏子节点增量；`freeze()` 标记快照冻结 |
+| `WireMergeEngine` | Layer C（融合） | 统一承接 `AbstractLazyMessage` 与 `AbstractLazyBuilder` 的 Fast-Path 0/1/2/3 与 `getSerializedSize()` 计算，消除双份代码 |
+| `AbstractLazyMessage` | 对外只读快照 | 封装 `(final Base, @Nullable final Overlay)`，禁用 `equals`/`hashCode`/反射/`UnknownFieldSet` |
+| `AbstractLazyBuilder` | 状态机与游标 | 统一支持独立构建、`reuse(bytes)` 零分配复用以及绑定子 Builder 游标转发 |
+| `ImmutableLazyList` | 不可变懒列表 | `RandomAccess` + `AbstractList` 只读视图，按索引惰性解码列表项 |
 
-为了彻底根除“外来 clean 子对象被当成未修改原切片”以及“恢复原对象后状态与缓存不一致”的缺陷，父消息中的每个嵌套子消息槽位（如 `SLOT_USER` 或列表元素槽位）不再依赖 `!child.isClean()` 推断，而是由显式状态机驱动：
+---
+
+## 10. 关键边界、外挂状态机与 Protobuf Wire 语义契约
+
+### 10.1 外挂子对象状态机（External Overlay Sub-Slot State Machine）
+
+在 `OrderOverlay` 中，嵌套子消息 `SLOT_USER` 与列表 `ItemsOverlay` 不再反写父 `TapeEntry` 标志位，而是通过显式状态机与 `OrderBase` 融合：
 
 ```mermaid
 stateDiagram-v2
-    [*] --> SLOT_RAW_UNTOUCHED : parseFrom / wrap
-    SLOT_RAW_UNTOUCHED --> SLOT_READ_ONLY_VIEW : 调用 getUser() (仅懒绑定原切片)
-    SLOT_RAW_UNTOUCHED --> SLOT_IN_PLACE_BUILDER : 调用 getUserBuilder()
-    SLOT_READ_ONLY_VIEW --> SLOT_IN_PLACE_BUILDER : 调用 getUserBuilder()
-    SLOT_RAW_UNTOUCHED --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
-    SLOT_READ_ONLY_VIEW --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
-    SLOT_IN_PLACE_BUILDER --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
-    SLOT_REPLACED_EXTERNAL --> SLOT_RAW_UNTOUCHED : setUser(origSliceCleanUser) 恢复原切片!
-    SLOT_IN_PLACE_BUILDER --> SLOT_RAW_UNTOUCHED : clear/回滚至原切片干净状态
-    SLOT_RAW_UNTOUCHED --> SLOT_CLEARED : 调用 clearUser()
-    SLOT_IN_PLACE_BUILDER --> SLOT_CLEARED : 调用 clearUser()
-    SLOT_REPLACED_EXTERNAL --> SLOT_CLEARED : 调用 clearUser()
+    [*] --> USER_INHERIT_BASE : 初始 overlay=null 或 setUser(原完整clean切片)
+    USER_INHERIT_BASE --> USER_PATCHED : getUserBuilder().setXxx() (按需分配 UserOverlay)
+    USER_INHERIT_BASE --> USER_REPLACED : setUser(externalImmutableUser)
+    USER_INHERIT_BASE --> USER_DELETED : clearUser() / userBuilder.clear()
+    USER_PATCHED --> USER_REPLACED : setUser(externalImmutableUser)
+    USER_PATCHED --> USER_INHERIT_BASE : setUser(origSliceCleanUser) -> 恢复 FP0!
+    USER_PATCHED --> USER_DELETED : clearUser()
+    USER_REPLACED --> USER_PATCHED : getUserBuilder().setXxx() (在替换对象底座上增量覆盖)
+    USER_REPLACED --> USER_DELETED : clearUser()
+    USER_DELETED --> USER_PATCHED : userBuilder.setXxx() (基于 EMPTY 重新写入)
 ```
 
-| 父槽位状态 | 物理含义 | `toBuilder()` / `clone()` 行为 | 序列化 (`writeSplicedTo`) 行为 |
+| 子槽位状态 | 物理含义 | COW Fork (`toBuilder()` / `clone()`) | 融合序列化 (`WireMergeEngine`) |
 | :--- | :--- | :--- | :--- |
-| **`SLOT_RAW_UNTOUCHED`** | 从未读取也未修改 | 仅复制父 `FieldTape`，不分配子对象 | 直接随父 `FieldTape` 连续干净区间整块 `arraycopy` |
-| **`SLOT_READ_ONLY_VIEW`** | 仅调用过 `getUser()` 读取，未修改 | 新副本重置该槽位为 `SLOT_RAW_UNTOUCHED`（按需重绑共享 `buf`） | 直接随父 `FieldTape` 连续干净区间整块 `arraycopy` |
-| **`SLOT_IN_PLACE_BUILDER`** | 通过 `getUserBuilder()` 基于父原切片做了原地修改 | **深拷贝该子 Builder / 子视图** 并重绑到新父副本 | 若子级仅同长修改则走 **Fast-Path 1 原地修补**；否则走 **Fast-Path 2 子级增量拼接** |
-| **`SLOT_REPLACED_EXTERNAL`** | 通过 `setUser(extUser)` 替换为外部构建或外部解析的 `LazyUserProfile` | **必须保留并复制 `extUser` 引用**（即便 `extUser.isClean() == true`！） | 父级对应 Tape 条目标为 `DIRTY_VAR_SIZE`，写出 `extUser` 的完整字节（`extUser` 内部仍走自己的 Fast-Path 0/1/2！） |
-| **`SLOT_CLEARED`** | 调用了 `clearUser()` | 复制 `SLOT_CLEARED` 状态与 `FLAG_DELETED` | 跳过父 `FieldTape` 中该字段的所有分段 |
+| **`USER_INHERIT_BASE`** | 透传不可变底座 | 仅共享只读 `OrderBase`，0 复制 | 完整保留底座内单段或多段原始字节（Fast-Path 0） |
+| **`USER_PATCHED`** | 持有 `userPatchBase + userPatch` | 冻结 `userPatch` 后直接按引用共享（直到下次写入 `user` 才按需 COW） | 若底座单段且 `userPatch.isSameSizeDirtyOnly`，走 Fast-Path 1 往输出缓冲区原地修补；否则在 `TAIL` 位置递归融合输出 |
+| **`USER_REPLACED`** | 替换外部不可变 `LazyUserProfile` | 直接拷贝不可变引用（0 克隆代价） | 在 `TAIL` 位置输出新 `userReplaced`；若底座为 0 段则追加到尾部 |
+| **`USER_DELETED`** | 显式清空 | 复制 `USER_DELETED` 状态与 `deletedMask` | 跳过底座内所有 `KIND_SPLIT_SUB_CONT` / `KIND_SPLIT_SUB_TAIL` 分段 |
 
-> **尺寸缓存一致性定理**：任何导致父槽位状态发生转移的动作（包括从 `SLOT_IN_PLACE_BUILDER` 或 `SLOT_REPLACED_EXTERNAL` 重新 `setUser(origCleanUser)` 回到 `SLOT_RAW_UNTOUCHED`），**一律强制执行 `invalidateSizeCacheUpward()`（将当前节点及所有祖先节点的 `cachedSerializedSize` 置为 `-1`）**。
+> **尺寸缓存零失效漏洞定理**：在所有 `AbstractLazyMessage` 快照中，`(base, overlay)` 在构造期即双双 `freeze()`，其逻辑内容终身不可变，因此 `cachedSerializedSize` 一旦算出绝对不会过时；而在 `Builder` 内，任何 `ensureMutableOverlay()` 或子游标写后传播均严格置位 `cachedSerializedSize = -1`。
 
 ---
 
@@ -632,7 +621,7 @@ stateDiagram-v2
      - 读取单值 `getInt32(f)` / `getString(f)`：返回最后一条匹配 `fieldNumber` 且 `wireType` 合法的记录；
      - 读取子消息 `at(f)`：自动收集所有 `fieldNumber == f && wireType == LEN` 的分段并合并为多段子文档视图；
      - 写入单值 `setInt32(f, v)` / `setString(f, v)`：若原 Tape 中存在 `f`，将最后一条更新为新值并将前序同名记录标为 `FLAG_SHADOWED`；若原 Tape 中不存在 `f`（**缺字段插入**），写入独立的 `appendedFields` 表并在序列化尾部追加输出；
-     - 重复 `wrap()` 隔离：`resetSlots()` 使用 `Arrays.fill(directTapeIdx, -1)` 完整清空 `1..64`（含 `#64`）槽位，并清空 `mutatedBytes`、`childDocs` 与 `appendedCount`，读取脏值前强制校验 `tapeFlags(idx)`。
+   - **连续只读导航与已追加 `LEN` 读取**：`doc.at(1).at(2)`（缺失路径）绝不修改 `has()` 或多输出空子消息；`setString(2, payload)` 后调用 `doc.at(2)` 直接基于 `appendedBytes` 包装只读视图，绝不丢弃净荷。
 
 ---
 
@@ -726,7 +715,7 @@ flowchart TD
 
 ### 11.4 维度四 & 五：白盒惰性路径断言与双契约性能基准
 - **白盒计数器断言**：在测试中直接检查 `msg.isScanned()`、`msg.getUser().isScanned()`、`msg.isClean()`、`msg.isSameSizeDirtyOnly()`，确保不会出现“表面输出正确，实则退化为全量重编码”的隐性性能回退。
-- **双契约性能对齐**：在 Benchmark 中明确分列 **契约 A（`toBuilder()` 默认快照隔离模式）** 与 **契约 B（`toInPlaceBuilder()` 显式原地零分配复用模式）** 的耗时 (`ns/op`) 与堆分配 (`Bytes/op`)。
+- **双契约性能对齐**：在 Benchmark 中明确分列 **契约 A（`parseFrom + toBuilder()` 默认不可变快照隔离模式）** 与 **契约 B（`Builder.reuse()` 显式零分配复用外挂模式）** 的耗时 (`ns/op`) 与堆分配 (`Bytes/op`)。
 
 ---
 
@@ -758,20 +747,21 @@ lazy-proto/
 测试环境：**OpenJDK 21.0.13.1-LTS (Temurin 64-Bit Server VM)**，Linux x86_64。  
 基准数据包：`OrderEnvelope`（包含顶层标量/字符串、嵌套 `UserProfile`、**100 个 `LineItem` 子消息列表**、**4KB 二进制 `payload`** 以及 2 个未知扩展字段 `#50, #51`，单包大小约 **12.4 KB**）。
 
-### 12.1 优势场景集 vs 劣势场景集实测数据
+### 12.1 优势场景集 vs 劣势场景集实测数据（Architecture v3）
 
-| 类别 | 测试场景 | 官方 Protobuf 耗时 (`ns/op`) | **`lazy-proto` 耗时 (`ns/op`)** | **加速比 (Speedup)** | 官方堆分配 (`Bytes/op`) | **`lazy-proto` 堆分配 (`Bytes/op`)** |
+| 类别 | 测试场景 | 官方 Protobuf 耗时 (`ns/op`) | **`lazy-proto` v3 耗时 (`ns/op`)** | **加速比 (Speedup)** | 官方堆分配 (`Bytes/op`) | **`lazy-proto` v3 堆分配 (`Bytes/op`)** |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| **优势 A1** | 只读 3 个字段 (`orderId`, `status`, `user.vipLevel`) | 9,004.4 | **1,258.3** | **7.16x** | 38,712 B | **0 B** |
-| **优势 A2** | 读 2 个字段后未修改原样转发 (**Fast-Path 0**) | 20,837.3 | **717.5** | **29.04x** | 54,760 B | **0 B** |
-| **优势 A3** | 修改 3 个定长/同长字段 + 序列化 (**Fast-Path 1 原地覆写**) | 20,334.3 | **801.6** | **25.37x** | 57,248 B | **0 B** |
-| **优势 A4** | 修改变长字符串与嵌套子消息字段 + 拼接 (**Fast-Path 2**) | 18,810.3 | **2,255.9** | **8.34x** | 57,280 B | **104 B** |
-| **优势 A5** | 100 项 `repeated` 列表仅修改第 42 项 + 序列化 | 18,749.0 | **1,520.4** | **12.33x** | 57,216 B | **64 B** |
-| **优势 A6** | 网关脱敏删除 1 个敏感字段 (`clearAuthToken`) + 转发 | 18,615.1 | **833.0** | **22.35x** | 57,056 B | **24 B** |
-| **劣势 B1** | 从零构建新消息 (`newBuilder` 10 子项，0% 输入可复用) | 2,528.5 | **2,696.0** | **0.94x** | 4,032 B | **4,552 B** |
-| **劣势 B2** | **100% 全树读取**（读全部标量、字符串及全部 100 个子项所有字段） | 7,531.7 | **12,951.4** | **0.58x** | 38,784 B | **15,552 B** |
-| **劣势 B3** | **100% 全字段变长修改** + 重序列化（0% 原始切片可复用） | 8,512.6 | **6,979.0** | **1.22x** | 16,912 B | **2,840 B** |
-| **劣势 B4** | **11 字节极小消息**（仅 3 个整数，全读 + 全变长修改） | 375.9 | **602.0** | **0.62x** | 760 B | **24 B** |
+| **优势 A1** | 只读 3 个字段 (`orderId`, `status`, `user.vipLevel`) | 9,073.2 | **644.7** | **14.07x** | 38,611 B | **0 B** |
+| **优势 A2** | 读 2 个字段后未修改原样转发 (**Fast-Path 0**) | 20,693.7 | **827.0** | **25.02x** | 54,760 B | **0 B** |
+| **优势 A3** | 修改 3 个定长/同长字段 (`parseFrom + toBuilder()`，**Fast-Path 1**) | 18,977.4 | **1,682.1** | **11.28x** | 57,248 B | **4,136 B** |
+| **优势 A3-Zero** | 修改 3 个定长/同长字段 (`Builder.reuse()`，**Fast-Path 1**) | 19,107.3 | **1,365.9** | **13.99x** | 57,248 B | **0 B** |
+| **优势 A4** | 修改变长字符串与嵌套子消息字段 + 拼接 (**Fast-Path 2**) | 18,823.7 | **1,363.3** | **13.81x** | 57,280 B | **80 B** |
+| **优势 A5** | 100 项 `repeated` 列表仅修改第 42 项 + 序列化 | 19,009.3 | **1,676.3** | **11.34x** | 57,216 B | **194 B** |
+| **优势 A6** | 网关脱敏删除 1 个敏感字段 (`clearAuthToken`) + 转发 | 18,801.8 | **1,781.7** | **10.55x** | 57,056 B | **0 B** |
+| **劣势 B1** | 从零构建新消息 (`newBuilder` 10 子项，0% 输入可复用) | 2,215.1 | **3,269.3** | **0.68x** | 4,032 B | **5,832 B** |
+| **劣势 B2** | **100% 全树读取**（读全部标量、字符串及全部 100 个子项所有字段） | 6,486.5 | **10,066.7** | **0.64x** | 38,784 B | **4,237 B** |
+| **劣势 B3** | **100% 全字段变长修改** + 重序列化（0% 原始切片可复用） | 7,373.7 | **6,311.3** | **1.17x** | 16,912 B | **6,176 B** |
+| **劣势 B4** | **11 字节极小消息**（仅 3 个整数，全读 + 全变长修改） | 733.7 | **527.1** | **1.39x** | 760 B | **0 B** |
 
 ### 12.2 性能边界规律总结
 

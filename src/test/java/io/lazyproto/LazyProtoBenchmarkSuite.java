@@ -112,8 +112,8 @@ public class LazyProtoBenchmarkSuite {
                 .build()
                 .toByteArray();
 
-        // Reusable thread-local instance for LazyOrderEnvelope & output buffer
-        final LazyOrderEnvelope reusableLazy = new LazyOrderEnvelope();
+        // Reusable thread-local Builder/Editor (unfrozen Base + Overlay) & output buffer
+        final LazyOrderEnvelope.Builder reusableBuilder = LazyOrderEnvelope.newBuilder();
         final byte[] reusableOutBuf = new byte[complexBytes.length + 4096];
 
         List<BenchResult> results = new ArrayList<>();
@@ -135,8 +135,9 @@ public class LazyProtoBenchmarkSuite {
                     return msg.getOrderId() + msg.getStatus() + msg.getUser().getVipLevel();
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    return reusableLazy.getOrderId() + reusableLazy.getStatus() + reusableLazy.getUser().getVipLevel();
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length);
+                    return reusableBuilder.getOrderId() + reusableBuilder.getStatus()
+                            + reusableBuilder.getUserOrBuilder().getVipLevel();
                 }
         ));
 
@@ -154,18 +155,18 @@ public class LazyProtoBenchmarkSuite {
                     return 0;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    if (reusableLazy.getOrderId() > 0 && reusableLazy.getStatus() == 1) {
-                        return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length);
+                    if (reusableBuilder.getOrderId() > 0 && reusableBuilder.getStatus() == 1) {
+                        return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                     }
                     return 0;
                 }
         ));
 
-        // A3: Read-Few + In-Place Same-Size Patching (Fast-Path 1: status 1->2, fixed64 timestamp, nested double score)
+        // A3: Read-Few + In-Place Same-Size Patching via immutable parseFrom + toBuilder() (Fast-Path 1)
         results.add(runComparison(
                 "Advantageous (A3)",
-                "Modify 3 Same-Size Fields via toBuilder() Copy (Path 1)",
+                "Modify 3 Same-Size Fields via toBuilder() Overlay (Path 1)",
                 WARMUP, ITERS,
                 iter -> {
                     OrderEnvelope msg = OrderEnvelope.parseFrom(complexBytes);
@@ -177,8 +178,8 @@ public class LazyProtoBenchmarkSuite {
                     return updated.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    LazyOrderEnvelope.Builder b = reusableLazy.toBuilder()
+                    LazyOrderEnvelope msg = LazyOrderEnvelope.parseFrom(complexBytes);
+                    LazyOrderEnvelope.Builder b = msg.toBuilder()
                             .setStatus(2)
                             .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF));
                     b.getUserBuilder().setScore(98.75);
@@ -186,10 +187,10 @@ public class LazyProtoBenchmarkSuite {
                 }
         ));
 
-        // A3-InPlace: Same as A3 using explicit zero-alloc in-place mutation (toInPlaceBuilder)
+        // A3-Zero: Same as A3 using explicit reusable Builder overlay (0 B/op!)
         results.add(runComparison(
                 "Advantageous (A3-Zero)",
-                "Modify 3 Same-Size Fields via toInPlaceBuilder() (Path 1)",
+                "Modify 3 Same-Size Fields via Reusable Overlay (Path 1)",
                 WARMUP, ITERS,
                 iter -> {
                     OrderEnvelope msg = OrderEnvelope.parseFrom(complexBytes);
@@ -201,12 +202,11 @@ public class LazyProtoBenchmarkSuite {
                     return updated.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    reusableLazy.toInPlaceBuilder()
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length)
                             .setStatus(2)
                             .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF));
-                    reusableLazy.getUser().setScore(98.75);
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    reusableBuilder.getUserBuilder().setScore(98.75);
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -225,11 +225,11 @@ public class LazyProtoBenchmarkSuite {
                     return updated.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    reusableLazy.setBuyerName("alexander_the_great_vip_buyer")
-                                .setStatus(50000);
-                    reusableLazy.getUser().setCity("SHANGHAI_PUDONG");
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length)
+                            .setBuyerName("alexander_the_great_vip_buyer")
+                            .setStatus(50000);
+                    reusableBuilder.getUserBuilder().setCity("SHANGHAI_PUDONG");
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -250,11 +250,11 @@ public class LazyProtoBenchmarkSuite {
                     return updated.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    reusableLazy.getItems(42)
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length);
+                    reusableBuilder.getItemsBuilder(42)
                             .setQuantity(999)
                             .setDescription("UPDATED_ITEM_42_DESC");
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -269,9 +269,9 @@ public class LazyProtoBenchmarkSuite {
                     return redacted.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    reusableLazy.clearAuthToken();
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length);
+                    reusableBuilder.clearAuthToken();
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -365,16 +365,16 @@ public class LazyProtoBenchmarkSuite {
                     return sum;
                 },
                 iter -> {
-                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    long sum = reusableLazy.getOrderId() + reusableLazy.getBuyerName().length() + reusableLazy.getStatus()
-                            + reusableLazy.getUpdatedAtFixed64() + reusableLazy.getPayload().size()
-                            + reusableLazy.getAuthToken().length() + reusableLazy.getTraceId().length() + reusableLazy.getTotalCents();
-                    LazyUserProfile u = reusableLazy.getUser();
+                    reusableBuilder.reuse(complexBytes, 0, complexBytes.length);
+                    long sum = reusableBuilder.getOrderId() + reusableBuilder.getBuyerName().length() + reusableBuilder.getStatus()
+                            + reusableBuilder.getUpdatedAtFixed64() + reusableBuilder.getPayload().size()
+                            + reusableBuilder.getAuthToken().length() + reusableBuilder.getTraceId().length() + reusableBuilder.getTotalCents();
+                    var u = reusableBuilder.getUserOrBuilder();
                     sum += u.getUserId() + u.getCity().length() + u.getVipLevel()
                             + (long) u.getScore() + u.getEmail().length();
-                    int n = reusableLazy.getItemsCount();
+                    int n = reusableBuilder.getItemsCount();
                     for (int i = 0; i < n; i++) {
-                        LazyLineItem item = reusableLazy.getItems(i);
+                        var item = reusableBuilder.getItemsOrBuilder(i);
                         sum += item.getItemId() + item.getSku().length() + item.getQuantity()
                                 + item.getPriceCents() + item.getDescription().length();
                     }
@@ -419,8 +419,8 @@ public class LazyProtoBenchmarkSuite {
                     return b.build().toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(mediumBytes, 0, mediumBytes.length);
-                    reusableLazy.setOrderId(1L)
+                    reusableBuilder.reuse(mediumBytes, 0, mediumBytes.length)
+                            .setOrderId(1L)
                             .setBuyerName("mutated_full_tree_buyer_name_long")
                             .setStatus(99999)
                             .setUpdatedAtFixed64(42L)
@@ -428,21 +428,22 @@ public class LazyProtoBenchmarkSuite {
                             .setAuthToken("new_short_tok")
                             .setTraceId("new_trace_id_full_mutation_long_string")
                             .setTotalCents(5L);
-                    reusableLazy.getUser()
+                    reusableBuilder.getUserBuilder()
                             .setUserId(2L)
                             .setCity("GUANGZHOU_FULL_MUTATE")
                             .setVipLevel(10000)
                             .setScore(12.34)
                             .setEmail("full_mutate_user@example.org");
-                    for (int i = 0; i < reusableLazy.getItemsCount(); i++) {
-                        reusableLazy.getItems(i)
+                    int cnt = reusableBuilder.getItemsCount();
+                    for (int i = 0; i < cnt; i++) {
+                        reusableBuilder.getItemsBuilder(i)
                                 .setItemId(9000000L + i)
                                 .setSku("NEW-LONG-SKU-CODE-" + i)
                                 .setQuantity(50000)
                                 .setPriceCents(10L)
                                 .setDescription("Short");
                     }
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -462,12 +463,12 @@ public class LazyProtoBenchmarkSuite {
                     return updated.toByteArray().length;
                 },
                 iter -> {
-                    reusableLazy.wrap(tinyBytes, 0, tinyBytes.length);
-                    long sum = reusableLazy.getOrderId() + reusableLazy.getStatus() + reusableLazy.getTotalCents();
-                    reusableLazy.setOrderId(sum + 100000000L)
+                    reusableBuilder.reuse(tinyBytes, 0, tinyBytes.length);
+                    long sum = reusableBuilder.getOrderId() + reusableBuilder.getStatus() + reusableBuilder.getTotalCents();
+                    reusableBuilder.setOrderId(sum + 100000000L)
                             .setStatus(30000)
                             .setTotalCents(999999999L);
-                    return reusableLazy.writeToBuffer(reusableOutBuf, 0);
+                    return reusableBuilder.writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 

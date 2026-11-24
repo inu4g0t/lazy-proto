@@ -7,6 +7,7 @@ import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.Message;
 import com.google.protobuf.MessageLite;
 import com.google.protobuf.UnknownFieldSet;
+import io.lazyproto.wire.WireWriter;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -15,54 +16,71 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Snapshot-safe Builder base class using Ownership Transfer + Copy-on-Post-Build-Write.
+ * Unified snapshot-safe {@link Message.Builder} base class for Architecture v3
+ * (Immutable Base + External COW Overlay).
  *
- * <p>Calling {@link #build()} marks the builder as built and returns the underlying {@link AbstractLazyMessage}
- * directly with <b>zero extra copy</b>. Only if the caller continues to mutate the same builder <i>after</i>
- * {@link #build()} does {@link #ensureMutable()} shallow-fork the backing message so previously built snapshots
- * remain 100% isolated and immutable.
+ * <p>All write operations (`set*`, `clear()`, `mergeFrom()`) mutate only external overlays.
+ * Calling {@link #build()} freezes the base and active overlays in O(1) without deep copying;
+ * subsequent writes to the same builder (or any bound child cursor) copy-on-write only the frozen
+ * overlay nodes. Supports explicit thread-local zero-allocation reuse via {@link #reuse(byte[], int, int)}
+ * when snapshots are not retained.
  */
-public abstract class AbstractLazyBuilder<M extends AbstractLazyMessage<M>, B extends AbstractLazyBuilder<M, B>>
-        implements Message.Builder {
+public abstract class AbstractLazyBuilder<
+        M extends AbstractLazyMessage<M, Base, Ov>,
+        B extends AbstractLazyBuilder<M, B, Base, Ov>,
+        Base extends ImmutableWireBase,
+        Ov extends WireOverlay> implements Message.Builder {
 
-    protected M impl;
-    protected boolean built;
+    protected Base base;
+    protected Ov overlay;
+    private WireWriter cachedWriter;
 
-    protected AbstractLazyBuilder(M initialImpl) {
-        this.impl = initialImpl;
-        this.built = false;
+    protected AbstractLazyBuilder(Base initialBase, Ov initialOverlay) {
+        this.base = initialBase;
+        this.overlay = initialOverlay;
     }
 
-    public final boolean isBuilt() {
-        return built;
+    protected boolean isBoundToParent() {
+        return false;
     }
 
-    public final M impl() {
-        return impl;
+    protected abstract WireMergeEngine.Adapter<Base, Ov> mergeAdapter();
+
+    protected abstract Base newEmptyBase();
+
+    protected abstract Ov newEmptyOverlay();
+
+    protected abstract Ov copyMutableOverlay(Ov frozenOverlay);
+
+    protected abstract M wrapAsMessage(Base frozenBase, Ov frozenOverlay);
+
+    protected abstract M emptyDefaultMessage();
+
+    /**
+     * Resolves current read-only Base for this builder (or through parent if bound).
+     */
+    protected Base resolveReadBase() {
+        return this.base;
     }
 
-    public final void ensureMutable() {
-        if (built) {
-            this.impl = this.impl.copy();
-            this.built = false;
-            onForkedAfterBuild();
+    /**
+     * Resolves current read-only Overlay for this builder (may be {@code null} if clean).
+     */
+    protected Ov resolveReadOverlay() {
+        return this.overlay;
+    }
+
+    /**
+     * Ensures this builder owns an unfrozen Overlay ready for mutation (copying if frozen).
+     */
+    protected Ov ensureMutableOverlay() {
+        if (this.overlay == null) {
+            this.overlay = newEmptyOverlay();
+        } else if (this.overlay.isFrozen()) {
+            this.overlay = copyMutableOverlay(this.overlay);
         }
-    }
-
-    protected void onForkedAfterBuild() {}
-
-    protected void onBuild() {}
-
-    @Override
-    public M build() {
-        this.built = true;
-        onBuild();
-        return impl;
-    }
-
-    @Override
-    public M buildPartial() {
-        return build();
+        this.overlay.invalidateSizeCache();
+        return this.overlay;
     }
 
     @SuppressWarnings("unchecked")
@@ -70,12 +88,144 @@ public abstract class AbstractLazyBuilder<M extends AbstractLazyMessage<M>, B ex
         return (B) this;
     }
 
+    /**
+     * Thread-local zero-allocation entry point: resets this builder's internal base &amp; overlay
+     * when neither has been frozen into a built {@link AbstractLazyMessage} snapshot. If previously
+     * frozen, allocates a fresh base/overlay so existing snapshots remain 100% immutable.
+     */
+    public B reuse(byte[] data) {
+        return reuse(data, 0, data.length);
+    }
+
+    public B reuse(byte[] data, int offset, int length) {
+        if (isBoundToParent()) {
+            return replaceWithBytes(data, offset, length);
+        }
+        if (this.base == null || this.base.isFrozen()) {
+            this.base = newEmptyBase();
+        }
+        this.base.resetForReuse(data, offset, length);
+        if (this.overlay != null) {
+            if (this.overlay.isFrozen()) {
+                this.overlay = null;
+            } else {
+                resetOverlayInPlace(this.overlay);
+            }
+        }
+        onAfterReuse();
+        return self();
+    }
+
+    protected void resetOverlayInPlace(Ov ov) {}
+
+    protected void onAfterReuse() {}
+
+    protected B replaceWithBytes(byte[] data, int offset, int length) {
+        if (this.base == null || this.base.isFrozen()) {
+            this.base = newEmptyBase();
+        }
+        this.base.resetForReuse(data, offset, length);
+        if (this.overlay != null) {
+            this.overlay = null;
+        }
+        return self();
+    }
+
+    protected B replaceWithByteString(ByteString data) {
+        if (this.base == null || this.base.isFrozen()) {
+            this.base = newEmptyBase();
+        }
+        this.base.resetForReuse(data);
+        if (this.overlay != null) {
+            this.overlay = null;
+        }
+        return self();
+    }
+
+    protected B clearAllFields() {
+        if (this.base == null || this.base.isFrozen()) {
+            this.base = newEmptyBase();
+        } else {
+            this.base.resetForReuse(ImmutableWireBase.EMPTY_BYTES, 0, 0);
+        }
+        this.base.markScannedEmpty();
+        if (this.overlay != null) {
+            this.overlay = null;
+        }
+        return self();
+    }
+
+    @Override
+    public M build() {
+        Base b = resolveReadBase();
+        Ov o = resolveReadOverlay();
+        b.freeze();
+        if (o != null) {
+            o.freeze();
+        }
+        return wrapAsMessage(b, o);
+    }
+
+    @Override
+    public M buildPartial() {
+        return build();
+    }
+
     @Override
     public B clear() {
-        ensureMutable();
-        impl.reset();
-        impl.markScannedEmpty();
-        return self();
+        return clearAllFields();
+    }
+
+    @Override
+    public M getDefaultInstanceForType() {
+        return emptyDefaultMessage();
+    }
+
+    // ==================== Direct Serialization (Zero Snapshot Allocation for Reuse Loops) ====================
+
+    public int getSerializedSize() {
+        return WireMergeEngine.getSerializedSize(resolveReadBase(), resolveReadOverlay(), mergeAdapter());
+    }
+
+    public byte[] toByteArray() {
+        return WireMergeEngine.toByteArray(resolveReadBase(), resolveReadOverlay(), mergeAdapter());
+    }
+
+    public int writeToBuffer(byte[] target, int targetOffset) {
+        Base b = resolveReadBase();
+        Ov o = resolveReadOverlay();
+        WireMergeEngine.Adapter<Base, Ov> adapter = mergeAdapter();
+        if (!b.isMultiSegment() && adapter.isOverlayEmpty(b, o)) {
+            int len = b.rawLength();
+            System.arraycopy(b.rawBuffer(), b.rawOffset(), target, targetOffset, len);
+            return len;
+        }
+        if (o != null && adapter.isSameSizeDirtyOnly(b, o)) {
+            int len = b.rawLength();
+            System.arraycopy(b.rawBuffer(), b.rawOffset(), target, targetOffset, len);
+            adapter.applyInPlacePatches(b, o, target, b.rawOffset() - targetOffset);
+            return len;
+        }
+        if (cachedWriter == null) {
+            cachedWriter = new WireWriter(target, targetOffset);
+        } else {
+            cachedWriter.reset(target, targetOffset);
+        }
+        WireMergeEngine.writeSplicedTo(b, o, adapter, cachedWriter);
+        return cachedWriter.position() - targetOffset;
+    }
+
+    public boolean isScanned() {
+        return resolveReadBase().isScanned();
+    }
+
+    public boolean isClean() {
+        return mergeAdapter().isOverlayEmpty(resolveReadBase(), resolveReadOverlay());
+    }
+
+    public boolean isSameSizeDirtyOnly() {
+        Ov o = resolveReadOverlay();
+        return o != null && mergeAdapter().isSameSizeDirtyOnly(resolveReadBase(), o);
     }
 
     @Override
@@ -87,29 +237,18 @@ public abstract class AbstractLazyBuilder<M extends AbstractLazyMessage<M>, B ex
     }
 
     @Override
-    public M getDefaultInstanceForType() {
-        return impl.copy();
-    }
-
-    @Override
     public B mergeFrom(byte[] data) {
-        ensureMutable();
-        impl.wrap(data, 0, data.length);
-        return self();
+        return mergeFrom(data, 0, data.length);
     }
 
     @Override
     public B mergeFrom(byte[] data, int off, int len) {
-        ensureMutable();
-        impl.wrap(data, off, len);
-        return self();
+        return replaceWithBytes(data, off, len);
     }
 
     @Override
     public B mergeFrom(ByteString data) {
-        ensureMutable();
-        impl.wrap(data);
-        return self();
+        return replaceWithByteString(data);
     }
 
     @Override
@@ -135,25 +274,20 @@ public abstract class AbstractLazyBuilder<M extends AbstractLazyMessage<M>, B ex
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     public B mergeFrom(Message other) {
-        ensureMutable();
-        if (other instanceof AbstractLazyMessage<?> lazyOther && !lazyOther.isMultiSegment() && lazyOther.isClean()) {
-            impl.wrap(lazyOther.rawBuffer(), lazyOther.rawOffset(), lazyOther.rawLength());
-        } else {
-            impl.wrap(other.toByteArray());
-        }
-        return self();
+        return mergeFromMessageLite(other);
     }
 
     @Override
     public B mergeFrom(MessageLite other) {
-        if (other instanceof AbstractLazyMessage<?> lazyOther && !lazyOther.isMultiSegment() && lazyOther.isClean()) {
-            ensureMutable();
-            impl.wrap(lazyOther.rawBuffer(), lazyOther.rawOffset(), lazyOther.rawLength());
-            return self();
+        return mergeFromMessageLite(other);
+    }
+
+    private B mergeFromMessageLite(MessageLite other) {
+        if (other instanceof AbstractLazyMessage<?, ?, ?> lazyOther && lazyOther.isClean() && !lazyOther.isMultiSegment()) {
+            return replaceWithBytes(lazyOther.rawBuffer(), lazyOther.rawOffset(), lazyOther.rawLength());
         }
-        return mergeFrom(other.toByteArray());
+        return replaceWithBytes(other.toByteArray(), 0, other.getSerializedSize());
     }
 
     @Override
