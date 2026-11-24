@@ -967,10 +967,13 @@ public class StatefulModelFuzzTest {
         // And navigating into appended valid submessage bytes on field #5 preserves and fuses subfields cleanly
         ProtoDocument.Builder db5Sub = ProtoDocument.newBuilder();
         byte[] validUserBytes = UserProfile.newBuilder().setUserId(42L).setCity("SZ").build().toByteArray();
-        db5Sub.setString(5, new String(validUserBytes, StandardCharsets.ISO_8859_1));
+        db5Sub.setString(5, new String(validUserBytes, StandardCharsets.UTF_8));
         ProtoDocument doc5Sub = db5Sub.build();
         assertEquals(42L, doc5Sub.at(5).getInt64(1));
-        assertArrayEquals(doc5Sub.toByteArray(), doc5Sub.toByteArray());
+        assertEquals("SZ", doc5Sub.at(5).getString(2));
+        OrderEnvelope parsedDoc5Sub = OrderEnvelope.parseFrom(doc5Sub.toByteArray());
+        assertEquals(42L, parsedDoc5Sub.getUser().getUserId());
+        assertEquals("SZ", parsedDoc5Sub.getUser().getCity());
 
         // #6: Read-only navigation on missing paths at(1).at(2) NEVER mutates presence or output
         ProtoDocument emptyDoc = ProtoDocument.newBuilder().build();
@@ -1004,5 +1007,105 @@ public class StatefulModelFuzzTest {
         assertEquals("", ((LazyOrderEnvelope) pb1.getDefaultInstanceForType()).getBuyerName());
         assertEquals(0L, ((LazyUserProfile) ub1.getDefaultInstanceForType()).getUserId());
         assertSame(ProtoDocument.EMPTY, db3.getDefaultInstanceForType());
+    }
+
+    @Test
+    @DisplayName("Pillar 4C: GitHub Issue #3 Round-3 Regression Matrix (All 9 Findings Covered)")
+    void testPillar4C_Issue3RegressionMatrix() throws IOException {
+        byte[] raw1 = createSeedOrderBytes(new Random(301), 3);
+        byte[] raw2 = OrderEnvelope.newBuilder()
+                .setOrderId(999L)
+                .setUser(UserProfile.newBuilder().setUserId(777L).setCity("GZ").setVipLevel(5).build())
+                .addItems(LineItem.newBuilder().setItemId(888L).setSku("SKU-R2").setQuantity(5).build())
+                .build().toByteArray();
+
+        // #1: Same-size edit on replaced external UserProfile (and dynamic subdoc) must NOT hit parent-slice FP1
+        byte[] extUserWire = UserProfile.newBuilder()
+                .setUserId(100001L)
+                .setCity("ExternalVeryLongCityName")
+                .setVipLevel(1) // 1-byte varint
+                .setScore(12.5)
+                .setEmail("ext-long@lazyproto.io")
+                .build().toByteArray();
+        LazyOrderEnvelope.Builder pb1 = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        pb1.setUser(LazyUserProfile.parseFrom(extUserWire));
+        pb1.getUserBuilder().setVipLevel(4); // same-size relative to extUserWire, NOT raw1!
+        LazyOrderEnvelope built1 = pb1.build();
+        assertFalse(built1.isSameSizeDirtyOnly());
+        assertEquals(4, built1.getUser().getVipLevel());
+        OrderEnvelope decoded1 = OrderEnvelope.parseFrom(built1.toByteArray());
+        assertEquals(4, decoded1.getUser().getVipLevel());
+        assertEquals("ExternalVeryLongCityName", decoded1.getUser().getCity());
+
+        // Same check for replaced LineItem + same-size quantity mutation
+        byte[] extItemWire = LineItem.newBuilder()
+                .setItemId(500001L).setSku("EXT-VERY-LONG-SKU-12345").setQuantity(1).build().toByteArray();
+        LazyOrderEnvelope.Builder pb1Item = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        pb1Item.setItems(0, LazyLineItem.parseFrom(extItemWire));
+        pb1Item.getItemsBuilder(0).setQuantity(6);
+        OrderEnvelope decoded1Item = OrderEnvelope.parseFrom(pb1Item.build().toByteArray());
+        assertEquals(6, decoded1Item.getItems(0).getQuantity());
+        assertEquals("EXT-VERY-LONG-SKU-12345", decoded1Item.getItems(0).getSku());
+
+        // Same check for ProtoDocument: replace subdoc via at(5).mergeFrom(...) + same-size mutation
+        ProtoDocument.Builder db1 = ProtoDocument.wrapBytes(raw1).toBuilder();
+        db1.at(5).mergeFrom(extUserWire);
+        db1.at(5).setInt32(3, 4);
+        ProtoDocument db1Built = db1.build();
+        assertFalse(db1Built.isSameSizeDirtyOnly());
+        OrderEnvelope decodedDb1 = OrderEnvelope.parseFrom(db1Built.toByteArray());
+        assertEquals(4, decodedDb1.getUser().getVipLevel());
+        assertEquals("ExternalVeryLongCityName", decodedDb1.getUser().getCity());
+
+        // #2: Sequential reuse(raw1) -> read child -> reuse(raw2) -> read child rebinds cleanly!
+        LazyOrderEnvelope.Builder reuseB = LazyOrderEnvelope.newBuilder();
+        reuseB.reuse(raw1);
+        assertEquals("Shanghai", reuseB.getUserOrBuilder().getCity());
+        assertEquals("SKU-100", reuseB.getItemsOrBuilder(0).getSku());
+        reuseB.reuse(raw2);
+        assertEquals(5, reuseB.getUserOrBuilder().getVipLevel());
+        assertEquals("GZ", reuseB.getUserOrBuilder().getCity());
+        assertEquals(5, reuseB.getItemsOrBuilder(0).getQuantity());
+        assertEquals("SKU-R2", reuseB.getItemsOrBuilder(0).getSku());
+        OrderEnvelope decodedReuse = OrderEnvelope.parseFrom(reuseB.toByteArray());
+        assertEquals(5, decodedReuse.getUser().getVipLevel());
+
+        // #3 & #5: ProtoDocument.Builder.at(1).mergeFrom(byte[] & ByteString) on empty parent
+        byte[] subBytes = new byte[] { 8, 2 }; // field #1 varint = 2
+        ProtoDocument.Builder db3Bytes = ProtoDocument.newBuilder();
+        db3Bytes.at(1).mergeFrom(subBytes);
+        assertTrue(db3Bytes.has(1));
+        assertEquals(2, db3Bytes.at(1).getInt32(1));
+        ProtoDocument built3Bytes = db3Bytes.build();
+        assertTrue(built3Bytes.has(1));
+        assertEquals(2, built3Bytes.at(1).getInt32(1));
+        assertArrayEquals(new byte[] { 0x0A, 0x02, 0x08, 0x02 }, built3Bytes.toByteArray());
+
+        ProtoDocument.Builder db3Bs = ProtoDocument.newBuilder();
+        db3Bs.at(1).mergeFrom(ByteString.copyFrom(subBytes));
+        assertTrue(db3Bs.has(1));
+        assertEquals(2, db3Bs.at(1).getInt32(1));
+        ProtoDocument built3Bs = db3Bs.build();
+        assertTrue(built3Bs.has(1));
+        assertEquals(2, built3Bs.at(1).getInt32(1));
+        assertArrayEquals(new byte[] { 0x0A, 0x02, 0x08, 0x02 }, built3Bs.toByteArray());
+
+        // #4 & #6: Frozen DocOverlay/OrderOverlay/ImmutableWireBase cannot be mutated externally
+        ProtoDocument.DocOverlay frozenDocOv = new ProtoDocument.DocOverlay();
+        frozenDocOv.freeze();
+        assertThrows(IllegalStateException.class, frozenDocOv::reset);
+        ProtoDocument.DocBase frozenDocBase = new ProtoDocument.DocBase();
+        frozenDocBase.wrapImmutable(new byte[] { 0x18, 0x02 }, 0, 2);
+        assertThrows(IllegalStateException.class, frozenDocBase::markScannedEmpty);
+
+        // #7: Builder.getItemsList() followed by clearItems() keeps snapshot list consistent
+        LazyOrderEnvelope.Builder pb7 = LazyOrderEnvelope.parseFrom(raw1).toBuilder();
+        List<LazyLineItem> oldList = pb7.getItemsList();
+        int oldSize = oldList.size();
+        assertTrue(oldSize >= 3);
+        pb7.clearItems();
+        assertEquals(0, pb7.getItemsCount());
+        assertEquals(oldSize, oldList.size());
+        assertEquals(100L, oldList.get(0).getItemId());
     }
 }

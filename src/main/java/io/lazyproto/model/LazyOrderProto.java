@@ -127,6 +127,7 @@ public final class LazyOrderProto {
         byte[] emailUtf8;
 
         public void reset() {
+            assertUnfrozen();
             this.writtenMask = 0L;
             this.city = null;
             this.cityUtf8 = null;
@@ -369,6 +370,8 @@ public final class LazyOrderProto {
             return new Builder(b, null);
         }
 
+        private UserBase baseRef() { return base; }
+        private UserOverlay overlayRef() { return overlay; }
         @Override protected WireMergeEngine.Adapter<UserBase, UserOverlay> mergeAdapter() { return UserOps.INSTANCE; }
         @Override public long getUserId() { return UserOps.getUserId(base, overlay); }
         @Override public String getCity() { return UserOps.getCity(base, overlay); }
@@ -402,7 +405,9 @@ public final class LazyOrderProto {
             }
 
             @Override protected boolean isBoundToParent() { return parentBuilder != null; }
-            @Override protected WireMergeEngine.Adapter<UserBase, UserOverlay> mergeAdapter() { return UserOps.INSTANCE; }
+            private UserBase baseRef() { return base; }
+        private UserOverlay overlayRef() { return overlay; }
+        @Override protected WireMergeEngine.Adapter<UserBase, UserOverlay> mergeAdapter() { return UserOps.INSTANCE; }
             @Override protected UserBase newEmptyBase() { return new UserBase(); }
             @Override protected UserOverlay newEmptyOverlay() { return new UserOverlay(); }
             @Override protected UserOverlay copyMutableOverlay(UserOverlay src) { return src.copyMutable(); }
@@ -610,6 +615,7 @@ public final class LazyOrderProto {
         byte[] descriptionUtf8;
 
         public void reset() {
+            assertUnfrozen();
             this.writtenMask = 0L;
             this.sku = null;
             this.skuUtf8 = null;
@@ -851,6 +857,8 @@ public final class LazyOrderProto {
             return new Builder(b, null);
         }
 
+        private LineItemBase baseRef() { return base; }
+        private LineItemOverlay overlayRef() { return overlay; }
         @Override protected WireMergeEngine.Adapter<LineItemBase, LineItemOverlay> mergeAdapter() { return LineItemOps.INSTANCE; }
         @Override public long getItemId() { return LineItemOps.getItemId(base, overlay); }
         @Override public String getSku() { return LineItemOps.getSku(base, overlay); }
@@ -887,7 +895,9 @@ public final class LazyOrderProto {
             }
 
             @Override protected boolean isBoundToParent() { return parentBuilder != null; }
-            @Override protected WireMergeEngine.Adapter<LineItemBase, LineItemOverlay> mergeAdapter() { return LineItemOps.INSTANCE; }
+            private LineItemBase baseRef() { return base; }
+        private LineItemOverlay overlayRef() { return overlay; }
+        @Override protected WireMergeEngine.Adapter<LineItemBase, LineItemOverlay> mergeAdapter() { return LineItemOps.INSTANCE; }
             @Override protected LineItemBase newEmptyBase() { return new LineItemBase(); }
             @Override protected LineItemOverlay newEmptyOverlay() { return new LineItemOverlay(); }
             @Override protected LineItemOverlay copyMutableOverlay(LineItemOverlay src) { return src.copyMutable(); }
@@ -1033,10 +1043,12 @@ public final class LazyOrderProto {
         int[] userSegTapeIdx;
         int userSegCount;
         UserBase cachedUserBase;
+        boolean userBaseBound;
 
         int[] itemsTapeIdx = EMPTY_INTS;
         int itemsCount;
         LineItemBase[] cachedItemBases;
+        boolean[] itemBaseBound;
 
         String buyerNameCache;
         String authTokenCache;
@@ -1070,6 +1082,7 @@ public final class LazyOrderProto {
         protected void resetBaseSlots() {
             Arrays.fill(slotTapeIdx, -1);
             userSegCount = 0;
+            userBaseBound = false;
             if (cachedUserBase != null) {
                 if (cachedUserBase.isFrozen()) {
                     cachedUserBase = null;
@@ -1079,6 +1092,9 @@ public final class LazyOrderProto {
             }
             for (int i = 0; i < itemsCount && cachedItemBases != null && i < cachedItemBases.length; i++) {
                 LineItemBase ib = cachedItemBases[i];
+                if (itemBaseBound != null && i < itemBaseBound.length) {
+                    itemBaseBound[i] = false;
+                }
                 if (ib != null) {
                     if (ib.isFrozen()) {
                         cachedItemBases[i] = null;
@@ -1181,17 +1197,20 @@ public final class LazyOrderProto {
                 return UserBase.EMPTY;
             }
             if (cachedUserBase == null) {
-                UserBase ub = new UserBase();
+                cachedUserBase = new UserBase();
+                userBaseBound = false;
+            }
+            if (!userBaseBound) {
                 if (userSegCount == 1) {
                     int idx = userSegTapeIdx[0];
-                    ub.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
+                    cachedUserBase.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
                 } else {
-                    ub.wrapMultiSegments(buf, tape, userSegTapeIdx, userSegCount);
+                    cachedUserBase.wrapMultiSegments(buf, tape, userSegTapeIdx, userSegCount);
                 }
                 if (this.frozen) {
-                    ub.freeze();
+                    cachedUserBase.freeze();
                 }
-                cachedUserBase = ub;
+                userBaseBound = true;
             }
             return cachedUserBase;
         }
@@ -1202,19 +1221,27 @@ public final class LazyOrderProto {
                 throw new IndexOutOfBoundsException("Index " + index + " out of bounds for length " + itemsCount);
             }
             if (cachedItemBases == null || index >= cachedItemBases.length) {
+                int newLen = Math.max(itemsCount, cachedItemBases == null ? 8 : cachedItemBases.length << 1);
                 cachedItemBases = cachedItemBases == null
-                        ? new LineItemBase[Math.max(itemsCount, 8)]
-                        : Arrays.copyOf(cachedItemBases, Math.max(itemsCount, cachedItemBases.length << 1));
+                        ? new LineItemBase[newLen]
+                        : Arrays.copyOf(cachedItemBases, newLen);
+                itemBaseBound = itemBaseBound == null
+                        ? new boolean[newLen]
+                        : Arrays.copyOf(itemBaseBound, newLen);
             }
             LineItemBase ib = cachedItemBases[index];
             if (ib == null) {
                 ib = new LineItemBase();
+                cachedItemBases[index] = ib;
+                itemBaseBound[index] = false;
+            }
+            if (!itemBaseBound[index]) {
                 int idx = itemsTapeIdx[index];
                 ib.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
                 if (this.frozen) {
                     ib.freeze();
                 }
-                cachedItemBases[index] = ib;
+                itemBaseBound[index] = true;
             }
             return ib;
         }
@@ -1271,9 +1298,11 @@ public final class LazyOrderProto {
             }
         }
 
-        boolean isSameSizeDirtyOnly() {
-            if (replaced) return false;
-            return patch != null && patch.isSameSizeDirtyOnly(base);
+        boolean isSameSizeDirtyOnly(OrderBase parentBase, int index) {
+            if (replaced || patch == null) return false;
+            return index >= 0 && index < parentBase.itemsCount
+                    && ImmutableWireBase.isSubSliceOf(base, parentBase, parentBase.itemsTapeIdx[index])
+                    && patch.isSameSizeDirtyOnly(base);
         }
 
         int getSerializedSize() {
@@ -1394,17 +1423,18 @@ public final class LazyOrderProto {
             return (denseDirtySlots != null && idx < denseDirtySlots.length) ? denseDirtySlots[idx] : null;
         }
 
-        void putBaseSlot(int idx, int baseCount, ItemSlot slot) {
+        void putBaseSlot(int idx, OrderBase parentBase, ItemSlot slot) {
+            int baseCount = parentBase.itemsCount;
             if (dirtyBaseCount == 0) {
                 singleDirtyIdx = idx;
                 singleDirtySlot = slot;
                 dirtyBaseCount = 1;
-                recomputeSameSizeCount(baseCount);
+                recomputeSameSizeCount(parentBase);
                 return;
             }
             if (dirtyBaseCount == 1 && singleDirtyIdx == idx) {
                 singleDirtySlot = slot;
-                recomputeSameSizeCount(baseCount);
+                recomputeSameSizeCount(parentBase);
                 return;
             }
             if (denseDirtySlots == null || denseDirtySlots.length < baseCount) {
@@ -1425,16 +1455,17 @@ public final class LazyOrderProto {
             }
             denseDirtySlots[idx] = slot;
             dirtyBitset[idx >>> 6] |= (1L << idx);
-            recomputeSameSizeCount(baseCount);
+            recomputeSameSizeCount(parentBase);
         }
 
-        void recomputeSameSizeCount(int baseCount) {
+        void recomputeSameSizeCount(OrderBase parentBase) {
+            int baseCount = parentBase.itemsCount;
             int ss = 0;
             if (dirtyBaseCount == 1 && singleDirtySlot != null) {
-                if (singleDirtySlot.isSameSizeDirtyOnly()) ss = 1;
+                if (singleDirtySlot.isSameSizeDirtyOnly(parentBase, singleDirtyIdx)) ss = 1;
             } else if (denseDirtySlots != null) {
                 for (int i = 0; i < baseCount && i < denseDirtySlots.length; i++) {
-                    if (denseDirtySlots[i] != null && denseDirtySlots[i].isSameSizeDirtyOnly()) {
+                    if (denseDirtySlots[i] != null && denseDirtySlots[i].isSameSizeDirtyOnly(parentBase, i)) {
                         ss++;
                     }
                 }
@@ -1509,6 +1540,7 @@ public final class LazyOrderProto {
         }
 
         public void reset() {
+            assertUnfrozen();
             this.writtenMask = 0L;
             this.buyerName = null;
             this.buyerNameUtf8 = null;
@@ -1671,28 +1703,36 @@ public final class LazyOrderProto {
         }
 
         static int getItemsCount(OrderBase base, OrderOverlay ov) {
-            if (ov != null && ov.itemsOverlay != null) {
-                int baseActive = ov.itemsOverlay.cleared ? 0 : (base.ensureScannedReturnItemsCount());
-                return baseActive + ov.itemsOverlay.appendedCount;
+            return getItemsCountFrom(base, ov != null ? ov.itemsOverlay : null);
+        }
+
+        static int getItemsCountFrom(OrderBase base, ItemsOverlay io) {
+            if (io != null) {
+                int baseActive = io.cleared ? 0 : base.ensureScannedReturnItemsCount();
+                return baseActive + io.appendedCount;
             }
             base.ensureScanned();
             return base.itemsCount;
         }
 
         static LazyLineItem getItemImmutable(OrderBase base, OrderOverlay ov, int index) {
-            int baseActive = (ov != null && ov.itemsOverlay != null && ov.itemsOverlay.cleared)
+            return getItemFrom(base, ov != null ? ov.itemsOverlay : null, index);
+        }
+
+        static LazyLineItem getItemFrom(OrderBase base, ItemsOverlay io, int index) {
+            int baseActive = (io != null && io.cleared)
                     ? 0
                     : base.ensureScannedReturnItemsCount();
-            int appCount = (ov != null && ov.itemsOverlay != null) ? ov.itemsOverlay.appendedCount : 0;
+            int appCount = io != null ? io.appendedCount : 0;
             int total = baseActive + appCount;
             if (index < 0 || index >= total) {
                 throw new IndexOutOfBoundsException("Index " + index + " out of bounds for length " + total);
             }
             if (index >= baseActive) {
-                return ov.itemsOverlay.appendedSlots[index - baseActive].toImmutableMessage();
+                return io.appendedSlots[index - baseActive].toImmutableMessage();
             }
-            if (ov != null && ov.itemsOverlay != null) {
-                ItemSlot slot = ov.itemsOverlay.getBaseSlot(index);
+            if (io != null) {
+                ItemSlot slot = io.getBaseSlot(index);
                 if (slot != null) {
                     return slot.toImmutableMessage();
                 }
@@ -1818,12 +1858,13 @@ public final class LazyOrderProto {
                 int slot = Long.numberOfTrailingZeros(mask);
                 if (slot == OrderBase.SLOT_ITEMS) {
                     ItemsOverlay io = ov.itemsOverlay;
-                    if (io.dirtyBaseCount == 1 && io.singleDirtySlot != null && io.singleDirtySlot.isSameSizeDirtyOnly()) {
+                    if (io.dirtyBaseCount == 1 && io.singleDirtySlot != null
+                            && io.singleDirtySlot.isSameSizeDirtyOnly(base, io.singleDirtyIdx)) {
                         LineItemOps.INSTANCE.applyInPlacePatches(io.singleDirtySlot.base, io.singleDirtySlot.patch, target, baseOffset);
                     } else if (io.denseDirtySlots != null) {
                         for (int i = 0; i < base.itemsCount && i < io.denseDirtySlots.length; i++) {
                             ItemSlot s = io.denseDirtySlots[i];
-                            if (s != null && s.isSameSizeDirtyOnly()) {
+                            if (s != null && s.isSameSizeDirtyOnly(base, i)) {
                                 LineItemOps.INSTANCE.applyInPlacePatches(s.base, s.patch, target, baseOffset);
                             }
                         }
@@ -2104,7 +2145,7 @@ public final class LazyOrderProto {
             UserBase resolveUserReadBase() {
                 if (overlay != null) {
                     if (overlay.userMode == OrderOverlay.USER_DELETED) return UserBase.EMPTY;
-                    if (overlay.userMode == OrderOverlay.USER_REPLACED) return overlay.userReplaced.base();
+                    if (overlay.userMode == OrderOverlay.USER_REPLACED) return overlay.userReplaced.baseRef();
                     if (overlay.userMode == OrderOverlay.USER_PATCHED && overlay.userPatchBase != null) {
                         return overlay.userPatchBase;
                     }
@@ -2115,7 +2156,7 @@ public final class LazyOrderProto {
             UserOverlay resolveUserReadOverlay() {
                 if (overlay != null) {
                     if (overlay.userMode == OrderOverlay.USER_DELETED) return null;
-                    if (overlay.userMode == OrderOverlay.USER_REPLACED) return overlay.userReplaced.overlay();
+                    if (overlay.userMode == OrderOverlay.USER_REPLACED) return overlay.userReplaced.overlayRef();
                     if (overlay.userMode == OrderOverlay.USER_PATCHED) return overlay.userPatch;
                 }
                 return null;
@@ -2125,9 +2166,9 @@ public final class LazyOrderProto {
                 OrderOverlay ov = ensureMutableOverlay();
                 if (ov.userMode == OrderOverlay.USER_REPLACED) {
                     LazyUserProfile prev = ov.userReplaced;
-                    ov.userPatchBase = prev.base();
+                    ov.userPatchBase = prev.baseRef();
                     ov.userPatchBase.freeze();
-                    ov.userPatch = prev.overlay() != null ? prev.overlay().copyMutable() : new UserOverlay();
+                    ov.userPatch = prev.overlayRef() != null ? prev.overlayRef().copyMutable() : new UserOverlay();
                     ov.userReplaced = null;
                     ov.userMode = OrderOverlay.USER_PATCHED;
                 } else {
@@ -2161,7 +2202,9 @@ public final class LazyOrderProto {
                 if (ov.userMode == OrderOverlay.USER_PATCHED) {
                     ov.writtenMask |= OrderOverlay.BIT_USER;
                     if (presentInBase) {
-                        if (!base.isUserMultiSegment() && ov.userPatch != null
+                        if (!base.isUserMultiSegment()
+                                && ImmutableWireBase.isSubSliceOf(ov.userPatchBase, base, base.slotTapeIdx[OrderBase.SLOT_USER])
+                                && ov.userPatch != null
                                 && ov.userPatch.isSameSizeDirtyOnly(ov.userPatchBase)) {
                             ov.sameSizeMask |= OrderOverlay.BIT_USER;
                             ov.varSizeMask &= ~OrderOverlay.BIT_USER;
@@ -2198,12 +2241,12 @@ public final class LazyOrderProto {
                 }
                 if (index >= baseActive) {
                     ItemSlot s = overlay.itemsOverlay.appendedSlots[index - baseActive];
-                    return s.replaced ? s.replacedMsg.base() : s.base;
+                    return s.replaced ? s.replacedMsg.baseRef() : s.base;
                 }
                 if (overlay != null && overlay.itemsOverlay != null) {
                     ItemSlot s = overlay.itemsOverlay.getBaseSlot(index);
                     if (s != null) {
-                        return s.replaced ? s.replacedMsg.base() : s.base;
+                        return s.replaced ? s.replacedMsg.baseRef() : s.base;
                     }
                 }
                 return base.getOrCreateItemBase(index);
@@ -2219,12 +2262,12 @@ public final class LazyOrderProto {
                 }
                 if (index >= baseActive) {
                     ItemSlot s = overlay.itemsOverlay.appendedSlots[index - baseActive];
-                    return s.replaced ? s.replacedMsg.overlay() : s.patch;
+                    return s.replaced ? s.replacedMsg.overlayRef() : s.patch;
                 }
                 if (overlay != null && overlay.itemsOverlay != null) {
                     ItemSlot s = overlay.itemsOverlay.getBaseSlot(index);
                     if (s != null) {
-                        return s.replaced ? s.replacedMsg.overlay() : s.patch;
+                        return s.replaced ? s.replacedMsg.overlayRef() : s.patch;
                     }
                 }
                 return null;
@@ -2241,10 +2284,10 @@ public final class LazyOrderProto {
                     int appIdx = index - baseActive;
                     ItemSlot s = io.appendedSlots[appIdx];
                     if (s.replaced) {
-                        LineItemBase sb = s.replacedMsg.base();
+                        LineItemBase sb = s.replacedMsg.baseRef();
                         sb.freeze();
-                        LineItemOverlay patch = s.replacedMsg.overlay() != null
-                                ? s.replacedMsg.overlay().copyMutable() : new LineItemOverlay();
+                        LineItemOverlay patch = s.replacedMsg.overlayRef() != null
+                                ? s.replacedMsg.overlayRef().copyMutable() : new LineItemOverlay();
                         s = ItemSlot.forPatch(sb, patch);
                         io.appendedSlots[appIdx] = s;
                     } else if (s.patch == null) {
@@ -2260,14 +2303,14 @@ public final class LazyOrderProto {
                     LineItemBase ib = base.getOrCreateItemBase(index);
                     LineItemOverlay patch = new LineItemOverlay();
                     s = ItemSlot.forPatch(ib, patch);
-                    io.putBaseSlot(index, base.itemsCount, s);
+                    io.putBaseSlot(index, base, s);
                 } else if (s.replaced) {
-                    LineItemBase sb = s.replacedMsg.base();
+                    LineItemBase sb = s.replacedMsg.baseRef();
                     sb.freeze();
-                    LineItemOverlay patch = s.replacedMsg.overlay() != null
-                            ? s.replacedMsg.overlay().copyMutable() : new LineItemOverlay();
+                    LineItemOverlay patch = s.replacedMsg.overlayRef() != null
+                            ? s.replacedMsg.overlayRef().copyMutable() : new LineItemOverlay();
                     s = ItemSlot.forPatch(sb, patch);
-                    io.putBaseSlot(index, base.itemsCount, s);
+                    io.putBaseSlot(index, base, s);
                 } else if (s.patch == null) {
                     s.patch = new LineItemOverlay();
                 } else if (s.patch.isFrozen()) {
@@ -2289,7 +2332,7 @@ public final class LazyOrderProto {
                     ov.appendedMask |= OrderOverlay.BIT_ITEMS;
                     return;
                 }
-                io.recomputeSameSizeCount(base.itemsCount);
+                io.recomputeSameSizeCount(base);
                 recomputeParentItemsMasks(ov, io);
             }
 
@@ -2451,8 +2494,14 @@ public final class LazyOrderProto {
             }
 
             public List<LazyLineItem> getItemsList() {
-                int sz = getItemsCount();
-                return new ImmutableLazyList<>(sz, this::getItems);
+                base.freeze();
+                ItemsOverlay snapIo = (overlay != null && overlay.itemsOverlay != null) ? overlay.itemsOverlay : null;
+                if (snapIo != null) {
+                    snapIo.freeze();
+                }
+                final OrderBase snapBase = base;
+                int sz = OrderOps.getItemsCountFrom(snapBase, snapIo);
+                return new ImmutableLazyList<>(sz, idx -> OrderOps.getItemFrom(snapBase, snapIo, idx));
             }
             @Override public List<? extends LineItemOrBuilder> getItemsOrBuilderList() { return getItemsList(); }
             @Override public int getItemsCount() { return OrderOps.getItemsCount(base, overlay); }
@@ -2473,7 +2522,7 @@ public final class LazyOrderProto {
                 if (index >= baseActive) {
                     io.appendedSlots[index - baseActive] = ItemSlot.forReplaced(item);
                 } else {
-                    io.putBaseSlot(index, base.itemsCount, ItemSlot.forReplaced(item));
+                    io.putBaseSlot(index, base, ItemSlot.forReplaced(item));
                 }
                 recomputeParentItemsMasks(this.overlay, io);
                 return this;

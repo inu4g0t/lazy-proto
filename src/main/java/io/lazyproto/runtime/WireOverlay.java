@@ -48,7 +48,14 @@ public abstract class WireOverlay {
     public final long deletedMask() { return deletedMask; }
     public final long appendedMask() { return appendedMask; }
 
+    protected final void assertUnfrozen() {
+        if (frozen) {
+            throw new IllegalStateException("Cannot mutate a frozen WireOverlay snapshot");
+        }
+    }
+
     protected final void resetMasksAndCache() {
+        assertUnfrozen();
         this.sameSizeMask = 0L;
         this.varSizeMask = 0L;
         this.deletedMask = 0L;

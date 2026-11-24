@@ -93,7 +93,19 @@ public abstract class ImmutableWireBase {
     }
 
     public final void markScannedEmpty() {
+        if (frozen) {
+            throw new IllegalStateException("Cannot markScannedEmpty on a frozen ImmutableWireBase");
+        }
         this.scanned = true;
+    }
+
+    public static boolean isSubSliceOf(ImmutableWireBase child, ImmutableWireBase parent, int parentTapeIdx) {
+        return child != null
+                && !child.isMultiSegment()
+                && parentTapeIdx >= 0
+                && child.rawBuffer() == parent.rawBuffer()
+                && child.rawOffset() == parent.tapeValueOffset(parentTapeIdx)
+                && child.rawLength() == parent.tapeValueLength(parentTapeIdx);
     }
 
     public final void wrapImmutable(byte[] buffer, int offset, int length) {

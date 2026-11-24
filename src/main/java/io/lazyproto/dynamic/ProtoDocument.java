@@ -251,13 +251,16 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
     public static final class DocSlot {
         DocBase base;
         DocOverlay overlay;
+        final boolean replacedBase;
 
-        DocSlot(DocBase base, DocOverlay overlay) {
+        DocSlot(DocBase base, DocOverlay overlay, boolean replacedBase) {
             this.base = base;
             this.overlay = overlay;
+            this.replacedBase = replacedBase;
         }
 
         boolean isEffectivelyEmpty() {
+            if (replacedBase) return false;
             return (base == null || base.rawLength() == 0)
                     && (overlay == null || overlay.isEffectivelyEmpty());
         }
@@ -270,7 +273,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
         DocSlot shallowShare() {
             if (base != null) base.freeze();
             if (overlay != null) overlay.freeze();
-            return new DocSlot(base, overlay);
+            return new DocSlot(base, overlay, replacedBase);
         }
     }
 
@@ -294,6 +297,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
         }
 
         public void reset() {
+            assertUnfrozen();
             this.bloomMask = 0L;
             Arrays.fill(bytesVals, 0, count, null);
             Arrays.fill(subDocs, 0, count, null);
@@ -367,7 +371,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                 byte st = states[i];
                 if (st == STATE_SUBDOC) {
                     DocSlot slot = subDocs[i];
-                    if (slot != null && slot.overlay != null && !slot.overlay.isEffectivelyEmpty()) {
+                    if (slot != null && (slot.replacedBase || (slot.overlay != null && !slot.overlay.isEffectivelyEmpty()))) {
                         return false;
                     }
                 } else {
@@ -394,12 +398,13 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                 }
                 if (st == STATE_SUBDOC) {
                     DocSlot slot = subDocs[i];
-                    if (slot == null || slot.overlay == null || slot.overlay.isEffectivelyEmpty()) {
+                    if (slot == null || (!slot.replacedBase && (slot.overlay == null || slot.overlay.isEffectivelyEmpty()))) {
                         continue;
                     }
                     int lenCount = base.countLenOccurrences(fn);
-                    if (lenCount == 1 && slot.base != null && !slot.base.isMultiSegment()
-                            && slot.overlay.isSameSizeDirtyOnly(slot.base)) {
+                    if (!slot.replacedBase && lenCount == 1
+                            && ImmutableWireBase.isSubSliceOf(slot.base, base, base.findLastLenTapeIdx(fn))
+                            && slot.overlay != null && slot.overlay.isSameSizeDirtyOnly(slot.base)) {
                         same = 1L;
                     } else if (lenCount >= 1) {
                         var = 1L;
@@ -654,10 +659,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
             byte st = ov.states[idx];
             if (st == STATE_SUBDOC) {
                 DocSlot slot = ov.subDocs[idx];
-                if (slot == null || slot.overlay == null || slot.overlay.isEffectivelyEmpty()) {
-                    return false;
-                }
-                return true;
+                return slot != null && (slot.replacedBase || (slot.overlay != null && !slot.overlay.isEffectivelyEmpty()));
             }
             return true;
         }
@@ -926,13 +928,13 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                             subBase.wrapImmutable(raw, 0, raw.length);
                             if (promoteScalarBytes) {
                                 DocOverlay subOv = new DocOverlay();
-                                DocSlot slot = new DocSlot(subBase, subOv);
+                                DocSlot slot = new DocSlot(subBase, subOv, true);
                                 pOv.states[idx] = STATE_SUBDOC;
                                 pOv.subDocs[idx] = slot;
                                 pOv.bytesVals[idx] = null;
                                 return slot;
                             }
-                            return new DocSlot(subBase, null);
+                            return new DocSlot(subBase, null, true);
                         }
                         throw new IllegalArgumentException("Field " + parentFieldNumber + " is not length-delimited");
                     }
@@ -950,7 +952,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
             if (subBase == DocBase.EMPTY) {
                 return null;
             }
-            return new DocSlot(subBase, null);
+            return new DocSlot(subBase, null, false);
         }
 
         private DocSlot resolveMutableSlotFromParent() {
@@ -970,16 +972,17 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
                 byte[] raw = pOv.bytesVals[idx];
                 DocBase subBase = new DocBase();
                 subBase.wrapImmutable(raw, 0, raw.length);
-                slot = new DocSlot(subBase, new DocOverlay());
+                slot = new DocSlot(subBase, new DocOverlay(), true);
                 pOv.states[idx] = STATE_SUBDOC;
                 pOv.subDocs[idx] = slot;
                 pOv.bytesVals[idx] = null;
             } else {
-                DocBase subBase = (idx >= 0 && pOv.states[idx] == STATE_DELETED)
+                boolean clearedInParent = (idx >= 0 && pOv.states[idx] == STATE_DELETED);
+                DocBase subBase = clearedInParent
                         ? DocBase.EMPTY
                         : pBase.buildOrGetSubBase(parentFieldNumber);
                 subBase.freeze();
-                slot = new DocSlot(subBase, new DocOverlay());
+                slot = new DocSlot(subBase, new DocOverlay(), clearedInParent);
                 int newIdx = pOv.getOrAllocEntry(parentFieldNumber);
                 pOv.states[newIdx] = STATE_SUBDOC;
                 pOv.wireTypes[newIdx] = WireFormat.WIRETYPE_LENGTH_DELIMITED;
@@ -1036,7 +1039,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
             DocOverlay pOv = parentBuilder.ensureMutableOverlay();
             DocBase newBase = new DocBase();
             newBase.wrapImmutable(Arrays.copyOfRange(data, offset, offset + length), 0, length);
-            DocSlot slot = new DocSlot(newBase, new DocOverlay());
+            DocSlot slot = new DocSlot(newBase, new DocOverlay(), true);
             int idx = pOv.getOrAllocEntry(parentFieldNumber);
             pOv.states[idx] = STATE_SUBDOC;
             pOv.wireTypes[idx] = WireFormat.WIRETYPE_LENGTH_DELIMITED;
@@ -1044,6 +1047,15 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
             pOv.subDocs[idx] = slot;
             parentBuilder.propagateMasksUpward();
             return this;
+        }
+
+        @Override
+        protected Builder replaceWithByteString(com.google.protobuf.ByteString data) {
+            if (parentBuilder == null) {
+                return super.replaceWithByteString(data);
+            }
+            byte[] bytes = data.toByteArray();
+            return replaceWithBytes(bytes, 0, bytes.length);
         }
 
         // -------------------- Read & Navigation Methods --------------------

@@ -39,11 +39,11 @@ public abstract class AbstractLazyMessage<
 
     protected abstract WireMergeEngine.Adapter<B, O> mergeAdapter();
 
-    public final B base() {
+    protected final B base() {
         return base;
     }
 
-    public final O overlay() {
+    protected final O overlay() {
         return overlay;
     }
 
