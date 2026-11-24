@@ -148,19 +148,17 @@ public class LazyProtoCorrectnessTest {
 
         // Use standard Java Protobuf idiom: order.toBuilder().setXxx().build()
         LazyOrderEnvelope lazy = LazyOrderEnvelope.parseFrom(raw);
-        LazyOrderEnvelope updated = lazy.toBuilder()
+        LazyOrderEnvelope.Builder b = lazy.toBuilder()
                 .setStatus(2)                                // 1 -> 2 (both 1-byte varint!)
-                .setUpdatedAtFixed64(1800000000999L)         // fixed64 (always 8 bytes!)
-                .build();
-
+                .setUpdatedAtFixed64(1800000000999L);        // fixed64 (always 8 bytes!)
         // Also mutate nested sub-message fields with same byte size
-        updated.getUser()
+        b.getUserBuilder()
                 .setCity("BJ")                               // "SH" -> "BJ" (both 2 UTF-8 bytes!)
                 .setScore(99.875)                            // double (always 8 bytes!)
                 .setVipLevel(5);                             // 3 -> 5 (both 1-byte varint!)
-
         // Also mutate 1 element in repeated list with same varint byte size
-        updated.getItems(7).setQuantity(9);                  // 3 -> 9 (both 1-byte varint!)
+        b.getItemsBuilder(7).setQuantity(9);                 // 3 -> 9 (both 1-byte varint!)
+        LazyOrderEnvelope updated = b.build();
 
         assertTrue(updated.isSameSizeDirtyOnly(), "All mutations have identical wire byte length -> must hit Fast-Path 1");
         assertEquals(raw.length, updated.getSerializedSize(), "Fast-Path 1 serialized size must equal original rawLength in O(1)");
@@ -314,7 +312,7 @@ public class LazyProtoCorrectnessTest {
     @Test
     @DisplayName("B1 (Adverse): From-Scratch Construction with Zero Input Buffer to Reuse")
     void testB1_FromScratchConstruction() throws IOException {
-        LazyOrderEnvelope scratch = LazyOrderEnvelope.newBuilder()
+        LazyOrderEnvelope.Builder scratch = LazyOrderEnvelope.newBuilder()
                 .setOrderId(999888777L)
                 .setBuyerName("scratch_builder_user")
                 .setStatus(4)
@@ -324,7 +322,8 @@ public class LazyProtoCorrectnessTest {
                         .setCity("HANGZHOU")
                         .setVipLevel(2)
                         .setScore(88.25)
-                        .setEmail("scratch@example.com"))
+                        .setEmail("scratch@example.com")
+                        .build())
                 .setPayloadBytes(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 })
                 .setAuthToken("token-from-scratch")
                 .setTraceId("trace-scratch-01")
@@ -336,10 +335,11 @@ public class LazyProtoCorrectnessTest {
                     .setSku("SCRATCH-SKU-" + i)
                     .setQuantity(i + 2)
                     .setPriceCents(500L * (i + 1))
-                    .setDescription("Built from scratch item " + i));
+                    .setDescription("Built from scratch item " + i)
+                    .build());
         }
 
-        byte[] out = scratch.toByteArray();
+        byte[] out = scratch.build().toByteArray();
         OrderEnvelope decoded = OrderEnvelope.parseFrom(out);
         assertEquals(999888777L, decoded.getOrderId());
         assertEquals("scratch_builder_user", decoded.getBuyerName());
@@ -443,17 +443,15 @@ public class LazyProtoCorrectnessTest {
         // 1. Polymorphic assignment to standard Google Protobuf interfaces
         OrderEnvelopeOrBuilder orBuilder = lazy;
         Message msg = lazy;
-        LazyOrderEnvelope builder = lazy.toBuilder();
+        LazyOrderEnvelope.Builder builder = lazy.toBuilder();
 
-        assertNotSame(lazy, builder, "toBuilder() must return a shallow-copied builder isolating mutations from the original message");
-        assertSame(builder, builder.build(), "build() on the builder returns itself with 0 extra copy");
         assertEquals(202611240001L, orBuilder.getOrderId());
         assertTrue(msg.isInitialized());
 
         // Verify toBuilder() snapshot isolation: mutating builder must NOT affect original 'lazy' message!
         builder.setStatus(99).setBuyerName("mutated_in_builder");
-        builder.getUser().setCity("BEIJING_ISOLATED");
-        builder.getItems(0).setQuantity(777);
+        builder.getUserBuilder().setCity("BEIJING_ISOLATED");
+        builder.getItemsBuilder(0).setQuantity(777);
 
         assertEquals(1, lazy.getStatus(), "Original message status must remain 1 after mutating toBuilder() copy");
         assertEquals("alice_wonderland", lazy.getBuyerName(), "Original buyerName must remain untouched");
@@ -461,10 +459,25 @@ public class LazyProtoCorrectnessTest {
         assertEquals(1, lazy.getItems(0).getQuantity(), "Original repeated item must remain untouched");
         assertTrue(lazy.isClean(), "Original message must still be 100% clean!");
 
-        assertEquals(99, builder.getStatus());
-        assertEquals("mutated_in_builder", builder.getBuyerName());
-        assertEquals("BEIJING_ISOLATED", builder.getUser().getCity());
-        assertEquals(777, builder.getItems(0).getQuantity());
+        LazyOrderEnvelope built1 = builder.build();
+        assertEquals(99, built1.getStatus());
+        assertEquals("mutated_in_builder", built1.getBuyerName());
+        assertEquals("BEIJING_ISOLATED", built1.getUser().getCity());
+        assertEquals(777, built1.getItems(0).getQuantity());
+
+        // Mutating the SAME builder AFTER build() must NOT corrupt built1!
+        LazyUserProfile.Builder heldUserBuilder = builder.getUserBuilder();
+        builder.setStatus(123).setBuyerName("post_build_mutation");
+        heldUserBuilder.setCity("GUANGZHOU_POST_BUILD");
+        LazyOrderEnvelope built2 = builder.build();
+
+        assertEquals(99, built1.getStatus(), "built1 must remain immutable after post-build builder mutation");
+        assertEquals("mutated_in_builder", built1.getBuyerName());
+        assertEquals("BEIJING_ISOLATED", built1.getUser().getCity());
+
+        assertEquals(123, built2.getStatus());
+        assertEquals("post_build_mutation", built2.getBuyerName());
+        assertEquals("GUANGZHOU_POST_BUILD", built2.getUser().getCity());
 
         // 2. Safeguarded toString() must NOT trigger scanning or deserialization
         LazyOrderEnvelope unscanned = LazyOrderEnvelope.parseFrom(raw);
@@ -480,11 +493,196 @@ public class LazyProtoCorrectnessTest {
         assertThrows(UnsupportedOperationException.class, lazy::getUnknownFields);
         assertThrows(UnsupportedOperationException.class, () -> lazy.hasField(null));
         assertThrows(UnsupportedOperationException.class, () -> lazy.getField(null));
-        assertThrows(UnsupportedOperationException.class, () -> lazy.setField(null, null));
-        assertThrows(UnsupportedOperationException.class, () -> lazy.clearField(null));
-        assertThrows(UnsupportedOperationException.class, () -> lazy.setUnknownFields(UnknownFieldSet.getDefaultInstance()));
+        assertThrows(UnsupportedOperationException.class, () -> builder.setField(null, null));
+        assertThrows(UnsupportedOperationException.class, () -> builder.clearField(null));
+        assertThrows(UnsupportedOperationException.class, () -> builder.setUnknownFields(UnknownFieldSet.getDefaultInstance()));
 
         // 4. Explicit rawBytesEquals replacement works as expected
         assertTrue(lazy.rawBytesEquals(unscanned));
+    }
+
+    // =========================================================================
+    // Category D: Review Regression Tests (GitHub Issue #1)
+    // =========================================================================
+
+    @Test
+    @DisplayName("D1: Replacing clean external User then toBuilder() fork (with & without prior getUser)")
+    void testD1_ReplaceCleanExternalUserThenFork() throws IOException {
+        byte[] parentBytes = createComplexOrderBytes(2, 32);
+        byte[] otherUserBytes = UserProfile.newBuilder()
+                .setUserId(999L)
+                .setCity("N")
+                .setVipLevel(9)
+                .setScore(10.0)
+                .setEmail("n@example.com")
+                .build()
+                .toByteArray();
+
+        LazyOrderEnvelope base = LazyOrderEnvelope.parseFrom(parentBytes);
+        LazyOrderEnvelope.Builder b = base.toBuilder();
+        b.setUser(LazyUserProfile.parseFrom(otherUserBytes)); // Replaced with CLEAN external User!
+
+        // Fork again via toBuilder() WITHOUT calling getUser() first
+        LazyOrderEnvelope forked1 = b.build().toBuilder().build();
+        byte[] out1 = forked1.toByteArray();
+        OrderEnvelope decoded1 = OrderEnvelope.parseFrom(out1);
+        assertEquals("N", decoded1.getUser().getCity());
+        assertEquals(999L, decoded1.getUser().getUserId());
+
+        // Fork again and read getUser() first
+        LazyOrderEnvelope forked2 = b.build().toBuilder().build();
+        assertEquals("N", forked2.getUser().getCity());
+        OrderEnvelope decoded2 = OrderEnvelope.parseFrom(forked2.toByteArray());
+        assertEquals("N", decoded2.getUser().getCity());
+    }
+
+    @Test
+    @DisplayName("D2: Restoring original clean User invalidates cachedSerializedSize (longer & shorter)")
+    void testD2_RestoreCleanUserInvalidatesSizeCache() throws IOException {
+        byte[] raw = createComplexOrderBytes(2, 32);
+        LazyOrderEnvelope base = LazyOrderEnvelope.parseFrom(raw);
+        LazyUserProfile origCleanUser = base.getUser().copy();
+
+        // Case 1: Lengthen then cache size then restore original clean user
+        LazyOrderEnvelope.Builder b1 = base.toBuilder();
+        b1.getUserBuilder().setCity("VERY_LONG_CITY_NAME_FOR_CACHE_TEST");
+        LazyOrderEnvelope longMsg = b1.build();
+        int longSize = longMsg.getSerializedSize();
+        assertTrue(longSize > raw.length);
+
+        longMsg.toInPlaceBuilder().setUser(origCleanUser.copy());
+        assertEquals(raw.length, longMsg.getSerializedSize());
+        byte[] out1 = longMsg.toByteArray();
+        assertEquals(raw.length, out1.length);
+        assertEquals("SH", OrderEnvelope.parseFrom(out1).getUser().getCity());
+
+        // Case 2: Shorten then cache size then restore original clean user
+        LazyOrderEnvelope.Builder b2 = base.toBuilder();
+        b2.getUserBuilder().setCity("A");
+        LazyOrderEnvelope shortMsg = b2.build();
+        int shortSize = shortMsg.getSerializedSize();
+        assertTrue(shortSize < raw.length);
+
+        shortMsg.toInPlaceBuilder().setUser(origCleanUser.copy());
+        assertEquals(raw.length, shortMsg.getSerializedSize());
+        byte[] out2 = shortMsg.toByteArray();
+        assertEquals(raw.length, out2.length);
+        assertEquals("SH", OrderEnvelope.parseFrom(out2).getUser().getCity());
+    }
+
+    @Test
+    @DisplayName("D3: ProtoDocument toBuilder(), clone(), repeated wrap() (including field #64), missing-field insert & unpacked repeated")
+    void testD3_ProtoDocumentEdgeCases() throws IOException {
+        byte[] raw = createComplexOrderBytes(2, 32);
+
+        // 1. toBuilder() & clone() snapshot isolation
+        ProtoDocument doc = ProtoDocument.wrapBytes(raw);
+        ProtoDocument.Builder b = doc.toBuilder();
+        ProtoDocument.Builder cloned = b.clone();
+        b.setInt32(3, 77).setString(2, "builder_buyer");
+        cloned.setInt32(3, 88).setString(2, "cloned_buyer");
+
+        ProtoDocument m1 = b.build();
+        b.setInt32(3, 99); // Post-build mutation
+        ProtoDocument m2 = b.build();
+
+        assertEquals(1, doc.getInt32(3));
+        assertEquals("alice_wonderland", doc.getString(2));
+        assertEquals(77, m1.getInt32(3));
+        assertEquals("builder_buyer", m1.getString(2));
+        assertEquals(99, m2.getInt32(3));
+        assertEquals(88, cloned.build().getInt32(3));
+
+        // 2. Repeated wrap() including field #64 and mutated string cache
+        ByteArrayOutputStream baos1 = new ByteArrayOutputStream();
+        CodedOutputStream cos1 = CodedOutputStream.newInstance(baos1);
+        cos1.writeInt32(64, 6400);
+        cos1.writeString(2, "first_msg");
+        cos1.flush();
+
+        ByteArrayOutputStream baos2 = new ByteArrayOutputStream();
+        CodedOutputStream cos2 = CodedOutputStream.newInstance(baos2);
+        cos2.writeString(2, "second_msg");
+        cos2.flush();
+
+        ProtoDocument reused = new ProtoDocument();
+        reused.wrap(baos1.toByteArray());
+        assertEquals(6400, reused.getInt32(64));
+        reused.setString(2, "mutated_first");
+        assertEquals("mutated_first", reused.getString(2));
+
+        reused.wrap(baos2.toByteArray());
+        assertFalse(reused.has(64), "Field #64 from previous wrap must be cleared");
+        assertEquals(0, reused.getInt32(64));
+        assertEquals("second_msg", reused.getString(2), "Mutated string from previous wrap must not leak");
+
+        // 3. Missing-field insertion & unpacked repeated preservation in ProtoDocument
+        ByteArrayOutputStream baos3 = new ByteArrayOutputStream();
+        CodedOutputStream cos3 = CodedOutputStream.newInstance(baos3);
+        cos3.writeInt32(1, 100);
+        cos3.writeInt32(15, 10);
+        cos3.writeInt32(15, 20);
+        cos3.writeInt32(15, 30);
+        cos3.flush();
+
+        ProtoDocument doc3 = ProtoDocument.wrapBytes(baos3.toByteArray());
+        doc3.setString(2, "inserted_buyer"); // Field #2 was absent!
+        doc3.setInt32(3, 5);                 // Field #3 was absent!
+        byte[] out3 = doc3.toByteArray();
+
+        OrderEnvelope decoded3 = OrderEnvelope.parseFrom(out3);
+        assertEquals(100L, decoded3.getOrderId());
+        assertEquals("inserted_buyer", decoded3.getBuyerName());
+        assertEquals(5, decoded3.getStatus());
+        // All 3 unpacked repeated #15 values must still be in unknown fields (not shadowed!)
+        assertEquals(3, decoded3.getUnknownFields().getField(15).getVarintList().size());
+    }
+
+    @Test
+    @DisplayName("D4: Split Sub-Message Merge & Wrong Wire Type Passthrough")
+    void testD4_SplitSubMessageMergeAndWrongWireType() throws IOException {
+        // Construct wire stream with split UserProfile (#5 appearing twice) and wrong wire type on field #1 (fixed64 instead of varint)
+        byte[] seg1 = UserProfile.newBuilder().setUserId(111L).setCity("SH").build().toByteArray();
+        byte[] seg2 = UserProfile.newBuilder().setVipLevel(7).setEmail("split@example.com").build().toByteArray();
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        CodedOutputStream cos = CodedOutputStream.newInstance(baos);
+        cos.writeFixed64(1, 999999L); // Wrong wire type for field #1 (expects VARINT, got FIXED64)
+        cos.writeByteArray(5, seg1);
+        cos.writeInt32(3, 1);
+        cos.writeByteArray(5, seg2);
+        cos.flush();
+        byte[] wire = baos.toByteArray();
+
+        // 1. Typed LazyOrderEnvelope: wrong wire type must NOT crash getOrderId(), and split user must merge!
+        LazyOrderEnvelope lazy = LazyOrderEnvelope.parseFrom(wire);
+        assertEquals(0L, lazy.getOrderId(), "Wrong wire type for field #1 must be ignored by typed getter");
+        assertEquals(111L, lazy.getUser().getUserId());
+        assertEquals("SH", lazy.getUser().getCity());
+        assertEquals(7, lazy.getUser().getVipLevel());
+        assertEquals("split@example.com", lazy.getUser().getEmail());
+
+        // Mutate merged user and re-serialize: both segments must merge cleanly and wrong wire type field #1 must pass through
+        LazyOrderEnvelope.Builder b = lazy.toBuilder();
+        b.getUserBuilder().setCity("HANGZHOU_MERGED");
+        byte[] out = b.build().toByteArray();
+
+        OrderEnvelope std = OrderEnvelope.parseFrom(out);
+        assertEquals(111L, std.getUser().getUserId());
+        assertEquals("HANGZHOU_MERGED", std.getUser().getCity());
+        assertEquals(7, std.getUser().getVipLevel());
+        assertEquals("split@example.com", std.getUser().getEmail());
+        assertTrue(std.getUnknownFields().hasField(1), "Wrong wire type #1 must be preserved as unknown field");
+
+        // 2. Dynamic ProtoDocument: split sub-message merge
+        ProtoDocument doc = ProtoDocument.wrapBytes(wire);
+        assertEquals(111L, doc.at(5).getInt64(1));
+        assertEquals(7, doc.at(5).getInt32(3));
+        assertEquals("split@example.com", doc.at(5).getString(5));
+        doc.at(5).setString(2, "DOC_MERGED");
+        OrderEnvelope docOut = OrderEnvelope.parseFrom(doc.toByteArray());
+        assertEquals("DOC_MERGED", docOut.getUser().getCity());
+        assertEquals(111L, docOut.getUser().getUserId());
+        assertEquals(7, docOut.getUser().getVipLevel());
     }
 }

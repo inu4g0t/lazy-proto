@@ -2,12 +2,9 @@ package io.lazyproto.runtime;
 
 import com.google.protobuf.ByteOutput;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.Descriptors;
-import com.google.protobuf.ExtensionRegistryLite;
 import com.google.protobuf.Message;
-import com.google.protobuf.MessageLite;
 import com.google.protobuf.Parser;
 import com.google.protobuf.UnknownFieldSet;
 import com.google.protobuf.UnsafeByteOperations;
@@ -15,9 +12,7 @@ import io.lazyproto.wire.WireFormat;
 import io.lazyproto.wire.WireReader;
 import io.lazyproto.wire.WireWriter;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -27,10 +22,13 @@ import java.util.Map;
 /**
  * Base class for all lazy-proto messages.
  *
- * <p>Implements both {@link com.google.protobuf.Message} and {@link com.google.protobuf.Message.Builder}
- * to support zero-allocation unified self-builder semantics, while throwing {@link UnsupportedOperationException}
+ * <p>Implements {@link com.google.protobuf.Message}, while throwing {@link UnsupportedOperationException}
  * on non-lazy methods such as {@link #equals(Object)}, {@link #hashCode()}, {@link #getAllFields()},
  * and reflection Descriptor operations.
+ *
+ * <p>{@link #toBuilder()} returns a snapshot-isolated {@link AbstractLazyBuilder} backed by a shallow copy
+ * of the compact {@code FieldTape} (sharing the underlying {@code byte[]}), whereas {@link #toInPlaceBuilder()}
+ * returns {@code this} for explicit zero-allocation in-place hot-path mutations.
  *
  * <p>128-bit FieldTape layout (2 {@code long} words per wire record):
  * <ul>
@@ -39,8 +37,7 @@ import java.util.Map;
  *       | [31..28] flags (4-bit) | [27..24] headerLen (4-bit) | [23..0] nextTapeIdx (24-bit)}</li>
  * </ul>
  */
-public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
-        implements Message, Message.Builder {
+public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>> implements Message {
 
     // Tape Entry State Flags (4-bit)
     public static final int FLAG_CLEAN_RAW       = 0;
@@ -50,7 +47,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     public static final int FLAG_SHADOWED        = 4;
 
     public static final int NO_NEXT_IDX = 0xFFFFFF;
-    private static final byte[] EMPTY_BYTES = new byte[0];
+    protected static final byte[] EMPTY_BYTES = new byte[0];
     private static final long[] EMPTY_TAPE = new long[0];
 
     // Underlying raw input buffer slice
@@ -63,6 +60,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     protected long[] tape = EMPTY_TAPE;
     protected int tapeCount;
     protected boolean scanned;
+    protected boolean multiSegment;
 
     // 64-bit State Bitmasks
     protected long presentMask;
@@ -102,6 +100,31 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     }
 
     /**
+     * Wraps and merges multiple split sub-message segments linked via {@code nextTapeIdx} in {@code srcParent}.
+     */
+    public void wrapMultiSegments(AbstractLazyMessage<?> srcParent, int headTapeIdx, long fieldBit) {
+        reset();
+        this.buf = srcParent.buf;
+        this.multiSegment = true;
+        this.scanned = true;
+        this.parent = srcParent;
+        this.parentTapeIdx = headTapeIdx;
+        this.parentFieldBit = fieldBit;
+
+        int totalBodyLen = 0;
+        int seg = headTapeIdx;
+        while (seg != NO_NEXT_IDX) {
+            int valOff = srcParent.tapeValueOffset(seg);
+            int valLen = srcParent.tapeValueLength(seg);
+            totalBodyLen += valLen;
+            scanRange(this.buf, valOff, valOff + valLen);
+            seg = srcParent.tapeNextIdx(seg);
+        }
+        this.rawOffset = srcParent.tapeValueOffset(headTapeIdx);
+        this.rawLength = totalBodyLen;
+    }
+
+    /**
      * Zero-copy extraction from Google Protobuf {@link ByteString} using {@link UnsafeByteOperations}.
      */
     public M wrap(ByteString byteString) {
@@ -121,7 +144,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
                         range[0] = offset;
                         range[1] = len;
                     } else {
-                        // RopeByteString fallback: flatten once
                         byte[] flat = byteString.toByteArray();
                         holder[0] = flat;
                         range[0] = 0;
@@ -162,6 +184,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         this.rawLength = 0;
         this.tapeCount = 0;
         this.scanned = false;
+        this.multiSegment = false;
         this.presentMask = 0L;
         this.decodedMask = 0L;
         this.sameSizeDirtyMask = 0L;
@@ -169,6 +192,9 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         this.appendedMask = 0L;
         this.hasDeletedEntries = false;
         this.cachedSerializedSize = -1;
+        this.parent = null;
+        this.parentTapeIdx = -1;
+        this.parentFieldBit = 0L;
         resetSlots();
     }
 
@@ -177,17 +203,17 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     /**
      * Shallow-copies the tape index, bitmasks, and raw buffer reference from {@code src} into {@code this}.
      * The underlying raw {@code byte[] buf} is shared (zero-copy), while mutations on {@code this}
-     * are completely isolated from {@code src} (preserving standard Java {@code toBuilder()} snapshot semantics).
+     * are completely isolated from {@code src}.
      */
     protected void copyBaseFrom(AbstractLazyMessage<?> src) {
         if (!src.scanned && src.rawLength > 0) {
-            // Scan src once so its reusable tape is populated and shared across any subsequent toBuilder() forks!
             src.ensureScanned();
         }
         this.buf = src.buf;
         this.rawOffset = src.rawOffset;
         this.rawLength = src.rawLength;
         this.scanned = src.scanned;
+        this.multiSegment = src.multiSegment;
         this.tapeCount = src.tapeCount;
         if (src.tapeCount > 0) {
             int requiredWords = src.tapeCount << 1;
@@ -196,8 +222,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
             } else {
                 System.arraycopy(src.tape, 0, this.tape, 0, requiredWords);
             }
-        } else {
-            this.tapeCount = 0;
         }
         this.presentMask = src.presentMask;
         this.decodedMask = src.decodedMask;
@@ -209,12 +233,14 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     }
 
     /**
-     * Explicit zero-allocation in-place mutation view for extreme hot paths where snapshot isolation is not needed.
+     * Explicit zero-allocation in-place mutation handle for extreme hot paths where snapshot isolation is not needed.
      */
     @SuppressWarnings("unchecked")
     public M toInPlaceBuilder() {
         return (M) this;
     }
+
+    public abstract M copy();
 
     public final byte[] rawBuffer() {
         return buf;
@@ -232,6 +258,10 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         return scanned;
     }
 
+    public final boolean isMultiSegment() {
+        return multiSegment;
+    }
+
     public final void markScannedEmpty() {
         this.scanned = true;
     }
@@ -241,7 +271,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     }
 
     public final boolean isSameSizeDirtyOnly() {
-        return (varSizeDirtyMask | appendedMask) == 0L && !hasDeletedEntries && sameSizeDirtyMask != 0L;
+        return !multiSegment && (varSizeDirtyMask | appendedMask) == 0L && !hasDeletedEntries && sameSizeDirtyMask != 0L;
     }
 
     // ==================== Tier 1: Shallow Non-Recursive Wire Scanner ====================
@@ -257,16 +287,15 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         if (rawLength == 0) {
             return;
         }
-        final byte[] b = this.buf;
-        int cursor = this.rawOffset;
-        final int limit = cursor + this.rawLength;
+        scanRange(this.buf, this.rawOffset, this.rawOffset + this.rawLength);
+    }
 
+    protected final void scanRange(byte[] b, int cursor, int limit) {
         while (cursor < limit) {
             final int tagOffset = cursor;
             final int tag;
             final byte firstByte = b[cursor];
             if (firstByte >= 0) {
-                // Fast path: 1-byte tag (field numbers 1..15)
                 tag = firstByte;
                 cursor++;
             } else {
@@ -311,7 +340,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
                         throw new IllegalArgumentException("Invalid LENGTH_DELIMITED len=" + len + " at " + cursor);
                     }
                     valOffset = cursor;
-                    // O(1) skip across nested sub-message, string, bytes, or packed repeated array!
                     cursor += len;
                     recordEnd = cursor;
                     break;
@@ -351,115 +379,128 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         return idx;
     }
 
-    /**
-     * Hook called during {@link #scanCurrentLevel()} for each wire entry.
-     * Subclasses register the {@code tapeIdx} in their O(1) slot directory,
-     * mark shadowed duplicate scalar entries, or link repeated fields.
-     */
     protected abstract void onScanField(int fieldNumber, int wireType, int tapeIdx);
 
     // ==================== FieldTape Bit-Unpacking Accessors ====================
 
-    public final int tapeCount() {
-        return tapeCount;
-    }
-
-    public final int tapeTagOffset(int tapeIdx) {
-        return (int) (tape[tapeIdx << 1] >>> 32);
-    }
-
-    public final int tapeRecordEnd(int tapeIdx) {
-        return (int) tape[tapeIdx << 1];
-    }
-
-    public final int tapeRecordLength(int tapeIdx) {
-        long w0 = tape[tapeIdx << 1];
-        return (int) w0 - (int) (w0 >>> 32);
-    }
-
-    public final int tapeHeaderLength(int tapeIdx) {
-        return (int) ((tape[(tapeIdx << 1) + 1] >>> 24) & 0xFL);
-    }
-
+    public final int tapeCount() { return tapeCount; }
+    public final int tapeTagOffset(int tapeIdx) { return (int) (tape[tapeIdx << 1] >>> 32); }
+    public final int tapeRecordEnd(int tapeIdx) { return (int) tape[tapeIdx << 1]; }
+    public final int tapeRecordLength(int tapeIdx) { long w0 = tape[tapeIdx << 1]; return (int) w0 - (int) (w0 >>> 32); }
+    public final int tapeHeaderLength(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 24) & 0xFL); }
     public final int tapeValueOffset(int tapeIdx) {
         long w0 = tape[tapeIdx << 1];
         long w1 = tape[(tapeIdx << 1) + 1];
         return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL);
     }
-
     public final int tapeValueLength(int tapeIdx) {
         long w0 = tape[tapeIdx << 1];
         long w1 = tape[(tapeIdx << 1) + 1];
-        int tagOff = (int) (w0 >>> 32);
-        int recEnd = (int) w0;
-        int hdrLen = (int) ((w1 >>> 24) & 0xFL);
-        return recEnd - (tagOff + hdrLen);
+        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL));
     }
-
-    public final int tapeFieldNumber(int tapeIdx) {
-        return (int) (tape[(tapeIdx << 1) + 1] >>> 35);
-    }
-
-    public final int tapeWireType(int tapeIdx) {
-        return (int) ((tape[(tapeIdx << 1) + 1] >>> 32) & 0x7L);
-    }
-
-    public final int tapeFlags(int tapeIdx) {
-        return (int) ((tape[(tapeIdx << 1) + 1] >>> 28) & 0xFL);
-    }
-
+    public final int tapeFieldNumber(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] >>> 35); }
+    public final int tapeWireType(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 32) & 0x7L); }
+    public final int tapeFlags(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 28) & 0xFL); }
     public final void setTapeFlags(int tapeIdx, int flags) {
         int w1Idx = (tapeIdx << 1) + 1;
         tape[w1Idx] = (tape[w1Idx] & ~(0xFL << 28)) | ((long) (flags & 0xF) << 28);
     }
-
-    public final int tapeNextIdx(int tapeIdx) {
-        return (int) (tape[(tapeIdx << 1) + 1] & 0xFFFFFFL);
-    }
-
+    public final int tapeNextIdx(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] & 0xFFFFFFL); }
     public final void setTapeNextIdx(int tapeIdx, int nextIdx) {
         int w1Idx = (tapeIdx << 1) + 1;
         tape[w1Idx] = (tape[w1Idx] & ~0xFFFFFFL) | (nextIdx & 0xFFFFFFL);
     }
 
-    // ==================== Upward Dirty Propagation ====================
+    // ==================== Upward Dirty Propagation & Cache Invalidation ====================
+
+    protected final void invalidateSizeCacheUpward() {
+        AbstractLazyMessage<?> curr = this;
+        while (curr != null) {
+            curr.cachedSerializedSize = -1;
+            curr = curr.parent;
+        }
+    }
 
     protected final void bubbleSameSizeDirtyToParent() {
         if (parent != null) {
-            parent.onChildSameSizeDirty(parentTapeIdx, parentFieldBit);
+            parent.onChildSameSizeDirty(parentTapeIdx, parentFieldBit, this.multiSegment);
         }
     }
 
     protected final void bubbleVarSizeDirtyToParent() {
         this.cachedSerializedSize = -1;
         if (parent != null) {
-            parent.onChildVarSizeDirty(parentTapeIdx, parentFieldBit);
+            parent.onChildVarSizeDirty(parentTapeIdx, parentFieldBit, this.multiSegment);
         }
     }
 
-    protected final void onChildSameSizeDirty(int childTapeIdx, long fieldBit) {
-        if (childTapeIdx >= 0 && tapeFlags(childTapeIdx) == FLAG_CLEAN_RAW) {
-            setTapeFlags(childTapeIdx, FLAG_DIRTY_SAME_SIZE);
+    private void collapseMultiSegmentToDirty(int headIdx) {
+        int curr = headIdx;
+        while (curr != NO_NEXT_IDX) {
+            int next = tapeNextIdx(curr);
+            setTapeFlags(curr, next == NO_NEXT_IDX ? FLAG_DIRTY_VAR_SIZE : FLAG_SHADOWED);
+            curr = next;
+        }
+    }
+
+    protected final void onChildSameSizeDirty(int childTapeIdx, long fieldBit, boolean childMultiSegment) {
+        this.cachedSerializedSize = -1;
+        if (childTapeIdx >= 0) {
+            if (childMultiSegment && tapeNextIdx(childTapeIdx) != NO_NEXT_IDX) {
+                collapseMultiSegmentToDirty(childTapeIdx);
+                this.varSizeDirtyMask |= fieldBit;
+                bubbleVarSizeDirtyToParent();
+                return;
+            }
+            if (tapeFlags(childTapeIdx) == FLAG_CLEAN_RAW) {
+                setTapeFlags(childTapeIdx, FLAG_DIRTY_SAME_SIZE);
+            }
         }
         this.sameSizeDirtyMask |= fieldBit;
         bubbleSameSizeDirtyToParent();
     }
 
-    protected final void onChildVarSizeDirty(int childTapeIdx, long fieldBit) {
+    protected final void onChildVarSizeDirty(int childTapeIdx, long fieldBit, boolean childMultiSegment) {
         if (childTapeIdx >= 0) {
-            setTapeFlags(childTapeIdx, FLAG_DIRTY_VAR_SIZE);
+            if (childMultiSegment && tapeNextIdx(childTapeIdx) != NO_NEXT_IDX) {
+                collapseMultiSegmentToDirty(childTapeIdx);
+            } else {
+                setTapeFlags(childTapeIdx, FLAG_DIRTY_VAR_SIZE);
+            }
+        } else {
+            this.appendedMask |= fieldBit;
         }
         this.varSizeDirtyMask |= fieldBit;
         this.cachedSerializedSize = -1;
         bubbleVarSizeDirtyToParent();
     }
 
+    protected final void restoreCleanChild(int childTapeIdx, long fieldBit) {
+        if (childTapeIdx >= 0) {
+            int curr = childTapeIdx;
+            while (curr != NO_NEXT_IDX) {
+                setTapeFlags(curr, FLAG_CLEAN_RAW);
+                curr = tapeNextIdx(curr);
+            }
+        }
+        this.sameSizeDirtyMask &= ~fieldBit;
+        this.varSizeDirtyMask &= ~fieldBit;
+        this.appendedMask &= ~fieldBit;
+        invalidateSizeCacheUpward();
+        if (parent != null) {
+            if (this.isClean()) {
+                parent.restoreCleanChild(parentTapeIdx, parentFieldBit);
+            } else if (this.isSameSizeDirtyOnly()) {
+                parent.onChildSameSizeDirty(parentTapeIdx, parentFieldBit, this.multiSegment);
+            }
+        }
+    }
+
     // ==================== Tier 4: Input-Reusing Serialization Engine ====================
 
     @Override
     public int getSerializedSize() {
-        // Fast-Path 0 & Fast-Path 1: No variable-size changes -> exact same byte length as raw input!
-        if (!scanned || ((varSizeDirtyMask | appendedMask) == 0L && !hasDeletedEntries)) {
+        if (!scanned || (!multiSegment && (varSizeDirtyMask | appendedMask) == 0L && !hasDeletedEntries)) {
             return this.rawLength;
         }
         if (this.cachedSerializedSize >= 0) {
@@ -473,7 +514,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
             } else if (flags == FLAG_DELETED || flags == FLAG_SHADOWED) {
                 continue;
             } else {
-                // FLAG_DIRTY_VAR_SIZE: compute size only for this dirty field
                 total += computeDirtyEntrySize(i, tapeFieldNumber(i), tapeWireType(i));
             }
         }
@@ -486,20 +526,17 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     @Override
     public byte[] toByteArray() {
-        // Fast-Path 0: 100% unmodified message -> single System.arraycopy
-        if (isClean()) {
+        if (!multiSegment && isClean()) {
             byte[] out = new byte[rawLength];
             System.arraycopy(buf, rawOffset, out, 0, rawLength);
             return out;
         }
-        // Fast-Path 1: Only same-size/fixed-size fields modified -> single System.arraycopy + O(1) offset patch
         if (isSameSizeDirtyOnly()) {
             byte[] out = new byte[rawLength];
             System.arraycopy(buf, rawOffset, out, 0, rawLength);
             applyInPlacePatches(out, rawOffset);
             return out;
         }
-        // Fast-Path 2 & 3: Contiguous Span Coalescing + Dirty Entry Encoding
         int size = getSerializedSize();
         byte[] out = new byte[size];
         WireWriter writer = new WireWriter(out, 0);
@@ -507,11 +544,8 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         return out;
     }
 
-    /**
-     * Writes directly into a target buffer or executes in-place patching when possible.
-     */
     public int writeToBuffer(byte[] target, int targetOffset) {
-        if (isClean()) {
+        if (!multiSegment && isClean()) {
             System.arraycopy(buf, rawOffset, target, targetOffset, rawLength);
             return rawLength;
         }
@@ -526,7 +560,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     }
 
     public void writeSplicedTo(WireWriter writer) {
-        if (isClean()) {
+        if (!multiSegment && isClean()) {
             writer.writeRawBytes(buf, rawOffset, rawLength);
             return;
         }
@@ -537,7 +571,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
             return;
         }
 
-        // Contiguous Span Coalescing Loop
         int spanStart = -1;
         int spanEnd = -1;
 
@@ -550,7 +583,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
                     spanStart = tagOff;
                     spanEnd = recEnd;
                 } else if (spanEnd == tagOff) {
-                    // Contiguous in physical input buffer! Coalesce into current span.
                     spanEnd = recEnd;
                 } else {
                     writer.writeRawBytes(buf, spanStart, spanEnd - spanStart);
@@ -563,7 +595,6 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
                     spanStart = -1;
                 }
             } else {
-                // FLAG_DIRTY_SAME_SIZE or FLAG_DIRTY_VAR_SIZE
                 if (spanStart != -1) {
                     writer.writeRawBytes(buf, spanStart, spanEnd - spanStart);
                     spanStart = -1;
@@ -583,8 +614,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     @Override
     public ByteString toByteString() {
-        if (isClean()) {
-            // Zero-copy ByteString wrapping the original input slice!
+        if (!multiSegment && isClean()) {
             return UnsafeByteOperations.unsafeWrap(buf, rawOffset, rawLength);
         }
         return UnsafeByteOperations.unsafeWrap(toByteArray());
@@ -592,17 +622,17 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     @Override
     public void writeTo(CodedOutputStream output) throws IOException {
-        byte[] bytes = isClean() ? null : toByteArray();
-        if (bytes == null) {
+        if (!multiSegment && isClean()) {
             output.writeRawBytes(buf, rawOffset, rawLength);
         } else {
+            byte[] bytes = toByteArray();
             output.writeRawBytes(bytes, 0, bytes.length);
         }
     }
 
     @Override
     public void writeTo(OutputStream output) throws IOException {
-        if (isClean()) {
+        if (!multiSegment && isClean()) {
             output.write(buf, rawOffset, rawLength);
         } else {
             output.write(toByteArray());
@@ -618,14 +648,10 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         writeTo(output);
     }
 
-    /**
-     * Explicit byte-level equality check on the underlying/serialized wire bytes,
-     * replacing {@link #equals(Object)}.
-     */
     public boolean rawBytesEquals(AbstractLazyMessage<?> other) {
         if (other == null) return false;
         if (this == other) return true;
-        if (this.isClean() && other.isClean()) {
+        if (!this.multiSegment && !other.multiSegment && this.isClean() && other.isClean()) {
             if (this.rawLength != other.rawLength) return false;
             return Arrays.equals(
                     this.buf, this.rawOffset, this.rawOffset + this.rawLength,
@@ -644,120 +670,9 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     protected abstract void writeAppendedFields(WireWriter writer);
 
-    // ==================== Message & Builder Lifecycle Methods ====================
-
     @Override
     public boolean isInitialized() {
         return true;
-    }
-
-    @Override
-    public Message.Builder clear() {
-        reset();
-        return this;
-    }
-
-    @Override
-    public Message build() {
-        return this;
-    }
-
-    @Override
-    public Message buildPartial() {
-        return this;
-    }
-
-    @Override
-    public Message.Builder clone() {
-        return toBuilder();
-    }
-
-    @Override
-    public Message.Builder mergeFrom(byte[] data) {
-        return wrap(data, 0, data.length);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(byte[] data, int off, int len) {
-        return wrap(data, off, len);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(ByteString data) {
-        return wrap(data);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(InputStream input) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] tmp = new byte[4096];
-        int n;
-        while ((n = input.read(tmp)) != -1) {
-            baos.write(tmp, 0, n);
-        }
-        return wrap(baos.toByteArray());
-    }
-
-    @Override
-    public Message.Builder mergeFrom(CodedInputStream input) throws IOException {
-        return mergeFrom(input, ExtensionRegistryLite.getEmptyRegistry());
-    }
-
-    @Override
-    public Message.Builder mergeFrom(CodedInputStream input, ExtensionRegistryLite extensionRegistry) throws IOException {
-        byte[] bytes = input.readRawBytes(input.getBytesUntilLimit());
-        return wrap(bytes);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(Message other) {
-        if (other instanceof AbstractLazyMessage<?> lazyOther && lazyOther.isClean()) {
-            return wrap(lazyOther.buf, lazyOther.rawOffset, lazyOther.rawLength);
-        }
-        return wrap(other.toByteArray());
-    }
-
-    @Override
-    public Message.Builder mergeFrom(MessageLite other) {
-        if (other instanceof AbstractLazyMessage<?> lazyOther && lazyOther.isClean()) {
-            return wrap(lazyOther.buf, lazyOther.rawOffset, lazyOther.rawLength);
-        }
-        return wrap(other.toByteArray());
-    }
-
-    @Override
-    public Message.Builder mergeFrom(byte[] data, ExtensionRegistryLite extensionRegistry) {
-        return wrap(data);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(byte[] data, int off, int len, ExtensionRegistryLite extensionRegistry) {
-        return wrap(data, off, len);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(ByteString data, ExtensionRegistryLite extensionRegistry) {
-        return wrap(data);
-    }
-
-    @Override
-    public Message.Builder mergeFrom(InputStream input, ExtensionRegistryLite extensionRegistry) throws IOException {
-        return mergeFrom(input);
-    }
-
-    @Override
-    public boolean mergeDelimitedFrom(InputStream input) throws IOException {
-        int firstByte = input.read();
-        if (firstByte == -1) return false;
-        int size = CodedInputStream.readRawVarint32(firstByte, input);
-        byte[] data = input.readNBytes(size);
-        wrap(data, 0, data.length);
-        return true;
-    }
-
-    @Override
-    public boolean mergeDelimitedFrom(InputStream input, ExtensionRegistryLite extensionRegistry) throws IOException {
-        return mergeDelimitedFrom(input);
     }
 
     @Override
@@ -765,7 +680,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
         throw new UnsupportedOperationException("getParserForType() is disabled in lazy-proto; use parseFrom/wrap.");
     }
 
-    // ==================== Intentionally Unsupported Methods (Throw Direct Exception) ====================
+    // ==================== Intentionally Unsupported Methods ====================
 
     @Override
     public final boolean equals(Object obj) {
@@ -837,58 +752,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
     }
 
     @Override
-    public final Message.Builder newBuilderForField(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder getFieldBuilder(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder getRepeatedFieldBuilder(Descriptors.FieldDescriptor field, int index) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder setField(Descriptors.FieldDescriptor field, Object value) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder clearField(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder clearOneof(Descriptors.OneofDescriptor oneof) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder setRepeatedField(Descriptors.FieldDescriptor field, int index, Object value) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder addRepeatedField(Descriptors.FieldDescriptor field, Object value) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder setUnknownFields(UnknownFieldSet unknownFields) {
-        throw new UnsupportedOperationException("UnknownFieldSet is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder mergeUnknownFields(UnknownFieldSet unknownFields) {
-        throw new UnsupportedOperationException("UnknownFieldSet is disabled in lazy-proto.");
-    }
-
-    @Override
     public String toString() {
-        // Safeguard: Never trigger TextFormat full-tree deserialization on toString()
         return getClass().getSimpleName() + "[rawLen=" + rawLength
                 + ", scanned=" + scanned
                 + ", decoded=0x" + Long.toHexString(decodedMask)

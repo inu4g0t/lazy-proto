@@ -6,6 +6,7 @@ import com.google.protobuf.UnsafeByteOperations;
 import io.lazyproto.model.OrderInterfaces.LineItemOrBuilder;
 import io.lazyproto.model.OrderInterfaces.OrderEnvelopeOrBuilder;
 import io.lazyproto.model.OrderInterfaces.UserProfileOrBuilder;
+import io.lazyproto.runtime.AbstractLazyBuilder;
 import io.lazyproto.runtime.AbstractLazyMessage;
 import io.lazyproto.runtime.LazyProtobufList;
 import io.lazyproto.wire.Utf8Slice;
@@ -20,16 +21,10 @@ import java.util.List;
 /**
  * Lazy-Proto generated-style Java classes for {@code OrderEnvelope}, {@code UserProfile}, and {@code LineItem}.
  *
- * <p>Implements the exact same {@link OrderEnvelopeOrBuilder}, {@link UserProfileOrBuilder}, {@link LineItemOrBuilder},
- * {@link com.google.protobuf.Message}, and {@link com.google.protobuf.Message.Builder} interfaces as standard
- * Google Protobuf, with:
- * <ul>
- *   <li>Tier-0 O(1) {@code wrap()} / {@code parseFrom(byte[])}</li>
- *   <li>Tier-1 non-recursive {@code ShallowScanner} into a flat 128-bit {@code FieldTape}</li>
- *   <li>Tier-2 on-demand per-field decoding & caching + zero-copy {@link Utf8Slice} & {@link LazyProtobufList}</li>
- *   <li>Tier-3 zero-allocation unified {@code toBuilder()} / {@code build()}</li>
- *   <li>Tier-4 4-path Input-Reusing Serialization (Passthrough, In-Place Patching, Contiguous Span Splicing, Dirty Tree)</li>
- * </ul>
+ * <p>Implements {@link OrderEnvelopeOrBuilder}, {@link UserProfileOrBuilder}, {@link LineItemOrBuilder},
+ * {@link com.google.protobuf.Message}, and {@link com.google.protobuf.Message.Builder} (via snapshot-isolated
+ * {@code Builder} inner classes with Ownership-Transfer + Copy-on-Post-Build-Write).
+ * Also exposes {@code toInPlaceBuilder()} for explicit zero-allocation hot-path mutations.
  */
 public final class LazyOrderProto {
     private LazyOrderProto() {}
@@ -73,10 +68,10 @@ public final class LazyOrderProto {
             return new LazyUserProfile().wrap(data, 0, data.length);
         }
 
-        public static LazyUserProfile newBuilder() {
+        public static Builder newBuilder() {
             LazyUserProfile m = new LazyUserProfile();
-            m.scanned = true;
-            return m;
+            m.markScannedEmpty();
+            return new Builder(m);
         }
 
         @Override
@@ -95,12 +90,28 @@ public final class LazyOrderProto {
         protected void onScanField(int fieldNumber, int wireType, int tapeIdx) {
             int slot;
             switch (fieldNumber) {
-                case 1: slot = SLOT_USER_ID; break;
-                case 2: slot = SLOT_CITY; break;
-                case 3: slot = SLOT_VIP_LEVEL; break;
-                case 4: slot = SLOT_SCORE; break;
-                case 5: slot = SLOT_EMAIL; break;
-                default: return; // Unknown field stays in FieldTape as CLEAN_RAW automatically!
+                case 1:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_USER_ID;
+                    break;
+                case 2:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_CITY;
+                    break;
+                case 3:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_VIP_LEVEL;
+                    break;
+                case 4:
+                    if (wireType != WireFormat.WIRETYPE_FIXED64) return;
+                    slot = SLOT_SCORE;
+                    break;
+                case 5:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_EMAIL;
+                    break;
+                default:
+                    return; // Unknown field stays in FieldTape as CLEAN_RAW
             }
             int prev = slotTapeIdx[slot];
             if (prev >= 0) {
@@ -253,6 +264,7 @@ public final class LazyOrderProto {
                 if (oldLen == newEncodedValueLen && tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE) {
                     setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
                     this.sameSizeDirtyMask |= bit;
+                    invalidateSizeCacheUpward();
                     bubbleSameSizeDirtyToParent();
                     return;
                 }
@@ -368,6 +380,7 @@ public final class LazyOrderProto {
             }
         }
 
+        @Override
         public LazyUserProfile copy() {
             LazyUserProfile c = new LazyUserProfile();
             c.copyFrom(this);
@@ -388,9 +401,53 @@ public final class LazyOrderProto {
         }
 
         @Override public Message getDefaultInstanceForType() { return new LazyUserProfile(); }
-        @Override public LazyUserProfile newBuilderForType() { return newBuilder(); }
-        @Override public LazyUserProfile toBuilder() { return copy(); }
-        @Override public LazyUserProfile build() { return this; }
+        @Override public Builder newBuilderForType() { return newBuilder(); }
+        @Override public Builder toBuilder() { return new Builder(this.copy()); }
+
+        public static final class Builder extends AbstractLazyBuilder<LazyUserProfile, Builder>
+                implements UserProfileOrBuilder {
+
+            private final LazyOrderEnvelope.Builder parentBuilder;
+
+            private Builder(LazyUserProfile initialImpl) {
+                super(initialImpl);
+                this.parentBuilder = null;
+            }
+
+            Builder(LazyUserProfile initialImpl, LazyOrderEnvelope.Builder parentBuilder) {
+                super(initialImpl);
+                this.parentBuilder = parentBuilder;
+            }
+
+            private void ensureBuilderMutable() {
+                if (parentBuilder != null) {
+                    if (parentBuilder.isBuilt()) {
+                        parentBuilder.ensureMutable();
+                        this.impl = parentBuilder.impl().getUserBuilder();
+                    }
+                } else {
+                    ensureMutable();
+                }
+            }
+
+            @Override public long getUserId() { return impl.getUserId(); }
+            public Builder setUserId(long v) { ensureBuilderMutable(); impl.setUserId(v); return this; }
+            @Override public String getCity() { return impl.getCity(); }
+            @Override public ByteString getCityBytes() { return impl.getCityBytes(); }
+            public Builder setCity(String v) { ensureBuilderMutable(); impl.setCity(v); return this; }
+            @Override public int getVipLevel() { return impl.getVipLevel(); }
+            public Builder setVipLevel(int v) { ensureBuilderMutable(); impl.setVipLevel(v); return this; }
+            @Override public double getScore() { return impl.getScore(); }
+            public Builder setScore(double v) { ensureBuilderMutable(); impl.setScore(v); return this; }
+            @Override public String getEmail() { return impl.getEmail(); }
+            @Override public ByteString getEmailBytes() { return impl.getEmailBytes(); }
+            public Builder setEmail(String v) { ensureBuilderMutable(); impl.setEmail(v); return this; }
+
+            @Override
+            public Builder clone() {
+                return new Builder(impl.copy());
+            }
+        }
     }
 
     // =========================================================================
@@ -432,10 +489,10 @@ public final class LazyOrderProto {
             return new LazyLineItem().wrap(data, 0, data.length);
         }
 
-        public static LazyLineItem newBuilder() {
+        public static Builder newBuilder() {
             LazyLineItem m = new LazyLineItem();
-            m.scanned = true;
-            return m;
+            m.markScannedEmpty();
+            return new Builder(m);
         }
 
         @Override
@@ -454,12 +511,28 @@ public final class LazyOrderProto {
         protected void onScanField(int fieldNumber, int wireType, int tapeIdx) {
             int slot;
             switch (fieldNumber) {
-                case 1: slot = SLOT_ITEM_ID; break;
-                case 2: slot = SLOT_SKU; break;
-                case 3: slot = SLOT_QUANTITY; break;
-                case 4: slot = SLOT_PRICE_CENTS; break;
-                case 5: slot = SLOT_DESCRIPTION; break;
-                default: return;
+                case 1:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_ITEM_ID;
+                    break;
+                case 2:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_SKU;
+                    break;
+                case 3:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_QUANTITY;
+                    break;
+                case 4:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_PRICE_CENTS;
+                    break;
+                case 5:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_DESCRIPTION;
+                    break;
+                default:
+                    return;
             }
             int prev = slotTapeIdx[slot];
             if (prev >= 0) {
@@ -602,6 +675,7 @@ public final class LazyOrderProto {
                 if (oldLen == newEncodedValueLen && tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE) {
                     setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
                     this.sameSizeDirtyMask |= bit;
+                    invalidateSizeCacheUpward();
                     bubbleSameSizeDirtyToParent();
                     return;
                 }
@@ -717,6 +791,7 @@ public final class LazyOrderProto {
             }
         }
 
+        @Override
         public LazyLineItem copy() {
             LazyLineItem c = new LazyLineItem();
             c.copyFrom(this);
@@ -737,9 +812,34 @@ public final class LazyOrderProto {
         }
 
         @Override public Message getDefaultInstanceForType() { return new LazyLineItem(); }
-        @Override public LazyLineItem newBuilderForType() { return newBuilder(); }
-        @Override public LazyLineItem toBuilder() { return copy(); }
-        @Override public LazyLineItem build() { return this; }
+        @Override public Builder newBuilderForType() { return newBuilder(); }
+        @Override public Builder toBuilder() { return new Builder(this.copy()); }
+
+        public static final class Builder extends AbstractLazyBuilder<LazyLineItem, Builder>
+                implements LineItemOrBuilder {
+
+            private Builder(LazyLineItem initialImpl) {
+                super(initialImpl);
+            }
+
+            @Override public long getItemId() { return impl.getItemId(); }
+            public Builder setItemId(long v) { ensureMutable(); impl.setItemId(v); return this; }
+            @Override public String getSku() { return impl.getSku(); }
+            @Override public ByteString getSkuBytes() { return impl.getSkuBytes(); }
+            public Builder setSku(String v) { ensureMutable(); impl.setSku(v); return this; }
+            @Override public int getQuantity() { return impl.getQuantity(); }
+            public Builder setQuantity(int v) { ensureMutable(); impl.setQuantity(v); return this; }
+            @Override public long getPriceCents() { return impl.getPriceCents(); }
+            public Builder setPriceCents(long v) { ensureMutable(); impl.setPriceCents(v); return this; }
+            @Override public String getDescription() { return impl.getDescription(); }
+            @Override public ByteString getDescriptionBytes() { return impl.getDescriptionBytes(); }
+            public Builder setDescription(String v) { ensureMutable(); impl.setDescription(v); return this; }
+
+            @Override
+            public Builder clone() {
+                return new Builder(impl.copy());
+            }
+        }
     }
 
     // =========================================================================
@@ -772,13 +872,13 @@ public final class LazyOrderProto {
         private static final long BIT_TOTAL      = 1L << SLOT_TOTAL;
 
         private final int[] slotTapeIdx = new int[] { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+        private int userTailTapeIdx = -1;
 
         private long orderId_;
         private String buyerName_;
         private byte[] buyerNameUtf8Dirty_;
         private int status_;
         private long updatedAtFixed64_;
-        // Pre-wired reusable child view (eliminates sub-message object allocation on reset/pool)
         private LazyUserProfile userView_;
         private final LazyProtobufList<LazyLineItem> itemsList_ =
                 new LazyProtobufList<>(this, BIT_ITEMS, LazyLineItem::new);
@@ -806,15 +906,16 @@ public final class LazyOrderProto {
             return new LazyOrderEnvelope().wrap(data);
         }
 
-        public static LazyOrderEnvelope newBuilder() {
+        public static Builder newBuilder() {
             LazyOrderEnvelope m = new LazyOrderEnvelope();
-            m.scanned = true;
-            return m;
+            m.markScannedEmpty();
+            return new Builder(m);
         }
 
         @Override
         protected void resetSlots() {
             Arrays.fill(slotTapeIdx, -1);
+            userTailTapeIdx = -1;
             orderId_ = 0L;
             buyerName_ = null;
             buyerNameUtf8Dirty_ = null;
@@ -837,22 +938,57 @@ public final class LazyOrderProto {
         protected void onScanField(int fieldNumber, int wireType, int tapeIdx) {
             int slot;
             switch (fieldNumber) {
-                case 1: slot = SLOT_ORDER_ID; break;
-                case 2: slot = SLOT_BUYER_NAME; break;
-                case 3: slot = SLOT_STATUS; break;
-                case 4: slot = SLOT_UPDATED_AT; break;
-                case 5: slot = SLOT_USER; break;
+                case 1:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_ORDER_ID;
+                    break;
+                case 2:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_BUYER_NAME;
+                    break;
+                case 3:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_STATUS;
+                    break;
+                case 4:
+                    if (wireType != WireFormat.WIRETYPE_FIXED64) return;
+                    slot = SLOT_UPDATED_AT;
+                    break;
+                case 5:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    // Split Sub-Message Merge Semantics: link segments instead of shadowing!
+                    if (slotTapeIdx[SLOT_USER] < 0) {
+                        slotTapeIdx[SLOT_USER] = tapeIdx;
+                        userTailTapeIdx = tapeIdx;
+                    } else {
+                        setTapeNextIdx(userTailTapeIdx, tapeIdx);
+                        userTailTapeIdx = tapeIdx;
+                    }
+                    presentMask |= BIT_USER;
+                    return;
                 case 6:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
                     itemsList_.linkScannedEntry(tapeIdx);
                     presentMask |= BIT_ITEMS;
                     return;
-                case 7: slot = SLOT_PAYLOAD; break;
-                case 8: slot = SLOT_AUTH_TOKEN; break;
-                case 9: slot = SLOT_TRACE_ID; break;
-                case 10: slot = SLOT_TOTAL; break;
+                case 7:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_PAYLOAD;
+                    break;
+                case 8:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_AUTH_TOKEN;
+                    break;
+                case 9:
+                    if (wireType != WireFormat.WIRETYPE_LENGTH_DELIMITED) return;
+                    slot = SLOT_TRACE_ID;
+                    break;
+                case 10:
+                    if (wireType != WireFormat.WIRETYPE_VARINT) return;
+                    slot = SLOT_TOTAL;
+                    break;
                 default:
-                    // Any unknown field (e.g., field #50, #51) remains in FieldTape as FLAG_CLEAN_RAW
-                    // and is automatically coalesced and copied during Span Splicing!
+                    // Any unknown field or mismatched wire type stays in FieldTape as CLEAN_RAW
                     return;
             }
             int prev = slotTapeIdx[slot];
@@ -984,9 +1120,12 @@ public final class LazyOrderProto {
                 }
                 int idx = slotTapeIdx[SLOT_USER];
                 if (idx >= 0) {
-                    // Tier-0 wrap only: does NOT scan UserProfile's internal fields until accessed!
-                    userView_.wrap(buf, tapeValueOffset(idx), tapeValueLength(idx));
-                    userView_.attachToParent(this, idx, BIT_USER);
+                    if (tapeNextIdx(idx) != NO_NEXT_IDX) {
+                        userView_.wrapMultiSegments(this, idx, BIT_USER);
+                    } else {
+                        userView_.wrap(buf, tapeValueOffset(idx), tapeValueLength(idx));
+                        userView_.attachToParent(this, idx, BIT_USER);
+                    }
                 } else {
                     userView_.reset();
                     userView_.markScannedEmpty();
@@ -1003,6 +1142,7 @@ public final class LazyOrderProto {
                 presentMask |= BIT_USER;
                 appendedMask |= BIT_USER;
                 varSizeDirtyMask |= BIT_USER;
+                bubbleVarSizeDirtyToParent();
             }
             return u;
         }
@@ -1015,8 +1155,8 @@ public final class LazyOrderProto {
         public LazyOrderEnvelope setUser(LazyUserProfile user) {
             ensureScanned();
             if (user == this.userView_) {
-                // Already in-place child view; dirty flags were already bubbled up!
                 this.presentMask |= BIT_USER;
+                invalidateSizeCacheUpward();
                 return this;
             }
             this.userView_ = user;
@@ -1025,20 +1165,36 @@ public final class LazyOrderProto {
             int idx = slotTapeIdx[SLOT_USER];
             if (idx >= 0) {
                 user.attachToParent(this, idx, BIT_USER);
-                if (user.rawBuffer() == this.buf
+                // Check if restoring the original single-segment slice from this.buf
+                if (tapeNextIdx(idx) == NO_NEXT_IDX
+                        && !user.isMultiSegment()
+                        && user.rawBuffer() == this.buf
                         && user.rawOffset() == tapeValueOffset(idx)
                         && user.rawLength() == tapeValueLength(idx)) {
                     if (user.isClean()) {
+                        restoreCleanChild(idx, BIT_USER);
                         return this;
                     }
-                    if (user.isSameSizeDirtyOnly() && tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE) {
+                    if (user.isSameSizeDirtyOnly()) {
                         setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
+                        this.varSizeDirtyMask &= ~BIT_USER;
+                        this.appendedMask &= ~BIT_USER;
                         this.sameSizeDirtyMask |= BIT_USER;
+                        invalidateSizeCacheUpward();
                         bubbleSameSizeDirtyToParent();
                         return this;
                     }
                 }
-                setTapeFlags(idx, FLAG_DIRTY_VAR_SIZE);
+                if (tapeNextIdx(idx) != NO_NEXT_IDX) {
+                    int curr = idx;
+                    while (curr != NO_NEXT_IDX) {
+                        int next = tapeNextIdx(curr);
+                        setTapeFlags(curr, next == NO_NEXT_IDX ? FLAG_DIRTY_VAR_SIZE : FLAG_SHADOWED);
+                        curr = next;
+                    }
+                } else {
+                    setTapeFlags(idx, FLAG_DIRTY_VAR_SIZE);
+                }
             } else {
                 user.attachToParent(this, -1, BIT_USER);
                 this.appendedMask |= BIT_USER;
@@ -1093,7 +1249,6 @@ public final class LazyOrderProto {
                 ensureScanned();
                 int idx = slotTapeIdx[SLOT_PAYLOAD];
                 if (idx >= 0) {
-                    // Zero-copy ByteString wrapping input buffer slice!
                     payload_ = UnsafeByteOperations.unsafeWrap(buf, tapeValueOffset(idx), tapeValueLength(idx));
                 } else {
                     payload_ = ByteString.EMPTY;
@@ -1166,13 +1321,19 @@ public final class LazyOrderProto {
             this.authTokenUtf8Dirty_ = null;
             this.decodedMask |= BIT_AUTH_TOKEN;
             this.presentMask &= ~BIT_AUTH_TOKEN;
+            boolean hadAppended = (this.appendedMask & BIT_AUTH_TOKEN) != 0L;
             this.appendedMask &= ~BIT_AUTH_TOKEN;
             int idx = slotTapeIdx[SLOT_AUTH_TOKEN];
             if (idx >= 0) {
                 setTapeFlags(idx, FLAG_DELETED);
                 slotTapeIdx[SLOT_AUTH_TOKEN] = -1;
                 this.hasDeletedEntries = true;
+                this.sameSizeDirtyMask &= ~BIT_AUTH_TOKEN;
                 this.varSizeDirtyMask |= BIT_AUTH_TOKEN;
+                bubbleVarSizeDirtyToParent();
+            } else if (hadAppended) {
+                this.varSizeDirtyMask &= ~BIT_AUTH_TOKEN;
+                invalidateSizeCacheUpward();
                 bubbleVarSizeDirtyToParent();
             }
             return this;
@@ -1244,6 +1405,7 @@ public final class LazyOrderProto {
                 if (oldLen == newEncodedValueLen && tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE) {
                     setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
                     this.sameSizeDirtyMask |= bit;
+                    invalidateSizeCacheUpward();
                     bubbleSameSizeDirtyToParent();
                     return;
                 }
@@ -1456,6 +1618,7 @@ public final class LazyOrderProto {
             }
         }
 
+        @Override
         public LazyOrderEnvelope copy() {
             LazyOrderEnvelope c = new LazyOrderEnvelope();
             c.copyFrom(this);
@@ -1465,17 +1628,23 @@ public final class LazyOrderProto {
         public LazyOrderEnvelope copyFrom(LazyOrderEnvelope src) {
             copyBaseFrom(src);
             System.arraycopy(src.slotTapeIdx, 0, this.slotTapeIdx, 0, slotTapeIdx.length);
+            this.userTailTapeIdx = src.userTailTapeIdx;
             this.orderId_ = src.orderId_;
             this.buyerName_ = src.buyerName_;
             this.buyerNameUtf8Dirty_ = src.buyerNameUtf8Dirty_;
             this.status_ = src.status_;
             this.updatedAtFixed64_ = src.updatedAtFixed64_;
-            if ((src.decodedMask & BIT_USER) != 0L && src.userView_ != null && !src.userView_.isClean()) {
+
+            boolean copyUserView = (src.decodedMask & BIT_USER) != 0L && src.userView_ != null
+                    && (!src.userView_.isClean()
+                        || (src.varSizeDirtyMask & BIT_USER) != 0L
+                        || (src.sameSizeDirtyMask & BIT_USER) != 0L
+                        || (src.appendedMask & BIT_USER) != 0L);
+            if (copyUserView) {
                 if (this.userView_ == null) this.userView_ = new LazyUserProfile();
                 this.userView_.copyFrom(src.userView_);
                 this.userView_.attachToParent(this, this.slotTapeIdx[SLOT_USER], BIT_USER);
             } else {
-                // Re-bind lazily on demand from shared buf!
                 this.decodedMask &= ~BIT_USER;
             }
             this.itemsList_.reset();
@@ -1491,8 +1660,89 @@ public final class LazyOrderProto {
         }
 
         @Override public Message getDefaultInstanceForType() { return new LazyOrderEnvelope(); }
-        @Override public LazyOrderEnvelope newBuilderForType() { return newBuilder(); }
-        @Override public LazyOrderEnvelope toBuilder() { return copy(); }
-        @Override public LazyOrderEnvelope build() { return this; }
+        @Override public Builder newBuilderForType() { return newBuilder(); }
+        @Override public Builder toBuilder() { return new Builder(this.copy()); }
+
+        public static final class Builder extends AbstractLazyBuilder<LazyOrderEnvelope, Builder>
+                implements OrderEnvelopeOrBuilder {
+
+            private Builder(LazyOrderEnvelope initialImpl) {
+                super(initialImpl);
+            }
+
+            @Override public long getOrderId() { return impl.getOrderId(); }
+            public Builder setOrderId(long v) { ensureMutable(); impl.setOrderId(v); return this; }
+
+            @Override public String getBuyerName() { return impl.getBuyerName(); }
+            @Override public ByteString getBuyerNameBytes() { return impl.getBuyerNameBytes(); }
+            public Builder setBuyerName(String v) { ensureMutable(); impl.setBuyerName(v); return this; }
+
+            @Override public int getStatus() { return impl.getStatus(); }
+            public Builder setStatus(int v) { ensureMutable(); impl.setStatus(v); return this; }
+
+            @Override public long getUpdatedAtFixed64() { return impl.getUpdatedAtFixed64(); }
+            public Builder setUpdatedAtFixed64(long v) { ensureMutable(); impl.setUpdatedAtFixed64(v); return this; }
+
+            @Override public boolean hasUser() { return impl.hasUser(); }
+            public LazyUserProfile getUser() { return impl.getUser(); }
+            @Override public UserProfileOrBuilder getUserOrBuilder() { return impl.getUserOrBuilder(); }
+
+            public LazyUserProfile.Builder getUserBuilder() {
+                ensureMutable();
+                return new LazyUserProfile.Builder(impl.getUserBuilder(), this);
+            }
+
+            public Builder setUser(LazyUserProfile v) {
+                ensureMutable();
+                impl.setUser(v);
+                return this;
+            }
+
+            public Builder setUser(LazyUserProfile.Builder b) {
+                return setUser(b.build());
+            }
+
+            public List<LazyLineItem> getItemsList() { return impl.getItemsList(); }
+            @Override public List<? extends LineItemOrBuilder> getItemsOrBuilderList() { return impl.getItemsOrBuilderList(); }
+            @Override public int getItemsCount() { return impl.getItemsCount(); }
+            public LazyLineItem getItems(int index) { return impl.getItems(index); }
+            @Override public LineItemOrBuilder getItemsOrBuilder(int index) { return impl.getItemsOrBuilder(index); }
+
+            public LazyLineItem getItemsBuilder(int index) {
+                ensureMutable();
+                return impl.getItems(index);
+            }
+
+            public Builder addItems(LazyLineItem item) {
+                ensureMutable();
+                impl.addItems(item);
+                return this;
+            }
+
+            public Builder addItems(LazyLineItem.Builder itemBuilder) {
+                return addItems(itemBuilder.build());
+            }
+
+            @Override public ByteString getPayload() { return impl.getPayload(); }
+            public Builder setPayload(ByteString v) { ensureMutable(); impl.setPayload(v); return this; }
+            public Builder setPayloadBytes(byte[] v) { ensureMutable(); impl.setPayloadBytes(v); return this; }
+
+            @Override public String getAuthToken() { return impl.getAuthToken(); }
+            @Override public ByteString getAuthTokenBytes() { return impl.getAuthTokenBytes(); }
+            public Builder setAuthToken(String v) { ensureMutable(); impl.setAuthToken(v); return this; }
+            public Builder clearAuthToken() { ensureMutable(); impl.clearAuthToken(); return this; }
+
+            @Override public String getTraceId() { return impl.getTraceId(); }
+            @Override public ByteString getTraceIdBytes() { return impl.getTraceIdBytes(); }
+            public Builder setTraceId(String v) { ensureMutable(); impl.setTraceId(v); return this; }
+
+            @Override public long getTotalCents() { return impl.getTotalCents(); }
+            public Builder setTotalCents(long v) { ensureMutable(); impl.setTotalCents(v); return this; }
+
+            @Override
+            public Builder clone() {
+                return new Builder(impl.copy());
+            }
+        }
     }
 }

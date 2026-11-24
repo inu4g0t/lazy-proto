@@ -178,12 +178,11 @@ public class LazyProtoBenchmarkSuite {
                 },
                 iter -> {
                     reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    LazyOrderEnvelope updated = reusableLazy.toBuilder()
+                    LazyOrderEnvelope.Builder b = reusableLazy.toBuilder()
                             .setStatus(2)
-                            .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF))
-                            .build();
-                    updated.getUser().setScore(98.75);
-                    return updated.writeToBuffer(reusableOutBuf, 0);
+                            .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF));
+                    b.getUserBuilder().setScore(98.75);
+                    return b.build().writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
@@ -315,7 +314,7 @@ public class LazyProtoBenchmarkSuite {
                     return b.build().toByteArray().length;
                 },
                 iter -> {
-                    LazyOrderEnvelope b = LazyOrderEnvelope.newBuilder()
+                    LazyOrderEnvelope.Builder b = LazyOrderEnvelope.newBuilder()
                             .setOrderId(202611240001L + iter)
                             .setBuyerName("scratch_buyer")
                             .setStatus(1)
@@ -325,7 +324,8 @@ public class LazyProtoBenchmarkSuite {
                                     .setCity("SHANGHAI")
                                     .setVipLevel(3)
                                     .setScore(95.5)
-                                    .setEmail("alice@example.com"))
+                                    .setEmail("alice@example.com")
+                                    .build())
                             .setPayloadBytes(smallPayload)
                             .setAuthToken("token-123456")
                             .setTraceId("trace-123456")
@@ -336,9 +336,10 @@ public class LazyProtoBenchmarkSuite {
                                 .setSku("SKU-00" + i)
                                 .setQuantity(2)
                                 .setPriceCents(1500L)
-                                .setDescription("Item desc"));
+                                .setDescription("Item desc")
+                                .build());
                     }
-                    return b.writeToBuffer(reusableOutBuf, 0);
+                    return b.build().writeToBuffer(reusableOutBuf, 0);
                 }
         ));
 
