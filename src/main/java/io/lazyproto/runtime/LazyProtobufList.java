@@ -24,13 +24,17 @@ public final class LazyProtobufList<E extends AbstractLazyMessage<E>>
     private int tailTapeIdx = AbstractLazyMessage.NO_NEXT_IDX;
     private int count;
 
+    private static final int[] EMPTY_INTS = new int[0];
+    private static final Object[] EMPTY_OBJS = new Object[0];
+    private static final boolean[] EMPTY_BOOLS = new boolean[0];
+
     // Lazily populated flat array mapping list index [0..count) -> tapeIdx
-    private int[] indexToTapeIdx = new int[8];
+    private int[] indexToTapeIdx = EMPTY_INTS;
     private boolean indexed;
 
     // Reusable pool of element view instances (only allocated up to accessed indices)
-    private Object[] elementViews = new Object[8];
-    private boolean[] elementLoaded = new boolean[8];
+    private Object[] elementViews = EMPTY_OBJS;
+    private boolean[] elementLoaded = EMPTY_BOOLS;
 
     // Newly appended elements (added via addElement() after deserialization)
     private Object[] appendedElements;
@@ -56,6 +60,40 @@ public final class LazyProtobufList<E extends AbstractLazyMessage<E>>
         this.count = 0;
         this.indexed = false;
         this.appendedCount = 0;
+    }
+
+    /**
+     * Shallow-copies the linked list head/tail/count from {@code src} without deserializing unvisited elements.
+     * Any already-mutated elements in {@code src} are shallow-cloned so mutations on the new builder remain isolated.
+     */
+    @SuppressWarnings("unchecked")
+    public void copyFrom(LazyProtobufList<E> src, java.util.function.Function<E, E> elementCopier) {
+        this.headTapeIdx = src.headTapeIdx;
+        this.tailTapeIdx = src.tailTapeIdx;
+        this.count = src.count;
+        this.indexed = false;
+        this.appendedCount = src.appendedCount;
+        if (src.appendedCount > 0) {
+            this.appendedElements = new Object[src.appendedElements.length];
+            for (int i = 0; i < src.appendedCount; i++) {
+                this.appendedElements[i] = elementCopier.apply((E) src.appendedElements[i]);
+            }
+        }
+        // Only clone element views that were actually mutated in src!
+        if (src.indexed) {
+            for (int i = 0; i < src.count; i++) {
+                if (src.elementLoaded[i] && src.elementViews[i] != null) {
+                    E srcElem = (E) src.elementViews[i];
+                    if (!srcElem.isClean()) {
+                        ensureIndexBuilt();
+                        E clonedElem = elementCopier.apply(srcElem);
+                        clonedElem.attachToParent(host, indexToTapeIdx[i], parentFieldBit);
+                        this.elementViews[i] = clonedElem;
+                        this.elementLoaded[i] = true;
+                    }
+                }
+            }
+        }
     }
 
     /**

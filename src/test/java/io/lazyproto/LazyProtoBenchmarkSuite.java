@@ -165,7 +165,7 @@ public class LazyProtoBenchmarkSuite {
         // A3: Read-Few + In-Place Same-Size Patching (Fast-Path 1: status 1->2, fixed64 timestamp, nested double score)
         results.add(runComparison(
                 "Advantageous (A3)",
-                "Modify 3 Same-Size/Fixed Fields + Serialize (Fast-Path 1)",
+                "Modify 3 Same-Size Fields via toBuilder() Copy (Path 1)",
                 WARMUP, ITERS,
                 iter -> {
                     OrderEnvelope msg = OrderEnvelope.parseFrom(complexBytes);
@@ -178,7 +178,32 @@ public class LazyProtoBenchmarkSuite {
                 },
                 iter -> {
                     reusableLazy.wrap(complexBytes, 0, complexBytes.length);
-                    reusableLazy.toBuilder()
+                    LazyOrderEnvelope updated = reusableLazy.toBuilder()
+                            .setStatus(2)
+                            .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF))
+                            .build();
+                    updated.getUser().setScore(98.75);
+                    return updated.writeToBuffer(reusableOutBuf, 0);
+                }
+        ));
+
+        // A3-InPlace: Same as A3 using explicit zero-alloc in-place mutation (toInPlaceBuilder)
+        results.add(runComparison(
+                "Advantageous (A3-Zero)",
+                "Modify 3 Same-Size Fields via toInPlaceBuilder() (Path 1)",
+                WARMUP, ITERS,
+                iter -> {
+                    OrderEnvelope msg = OrderEnvelope.parseFrom(complexBytes);
+                    OrderEnvelope updated = msg.toBuilder()
+                            .setStatus(2)
+                            .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF))
+                            .setUser(msg.getUser().toBuilder().setScore(98.75).build())
+                            .build();
+                    return updated.toByteArray().length;
+                },
+                iter -> {
+                    reusableLazy.wrap(complexBytes, 0, complexBytes.length);
+                    reusableLazy.toInPlaceBuilder()
                             .setStatus(2)
                             .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF));
                     reusableLazy.getUser().setScore(98.75);

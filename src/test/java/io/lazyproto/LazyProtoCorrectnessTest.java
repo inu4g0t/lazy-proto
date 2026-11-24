@@ -443,12 +443,28 @@ public class LazyProtoCorrectnessTest {
         // 1. Polymorphic assignment to standard Google Protobuf interfaces
         OrderEnvelopeOrBuilder orBuilder = lazy;
         Message msg = lazy;
-        Message.Builder builder = lazy.toBuilder();
+        LazyOrderEnvelope builder = lazy.toBuilder();
 
-        assertSame(lazy, builder, "Unified self-builder must return 'this' with 0 allocation");
-        assertSame(lazy, builder.build(), "build() must return 'this' with 0 allocation");
+        assertNotSame(lazy, builder, "toBuilder() must return a shallow-copied builder isolating mutations from the original message");
+        assertSame(builder, builder.build(), "build() on the builder returns itself with 0 extra copy");
         assertEquals(202611240001L, orBuilder.getOrderId());
         assertTrue(msg.isInitialized());
+
+        // Verify toBuilder() snapshot isolation: mutating builder must NOT affect original 'lazy' message!
+        builder.setStatus(99).setBuyerName("mutated_in_builder");
+        builder.getUser().setCity("BEIJING_ISOLATED");
+        builder.getItems(0).setQuantity(777);
+
+        assertEquals(1, lazy.getStatus(), "Original message status must remain 1 after mutating toBuilder() copy");
+        assertEquals("alice_wonderland", lazy.getBuyerName(), "Original buyerName must remain untouched");
+        assertEquals("SH", lazy.getUser().getCity(), "Original nested user city must remain untouched");
+        assertEquals(1, lazy.getItems(0).getQuantity(), "Original repeated item must remain untouched");
+        assertTrue(lazy.isClean(), "Original message must still be 100% clean!");
+
+        assertEquals(99, builder.getStatus());
+        assertEquals("mutated_in_builder", builder.getBuyerName());
+        assertEquals("BEIJING_ISOLATED", builder.getUser().getCity());
+        assertEquals(777, builder.getItems(0).getQuantity());
 
         // 2. Safeguarded toString() must NOT trigger scanning or deserialization
         LazyOrderEnvelope unscanned = LazyOrderEnvelope.parseFrom(raw);

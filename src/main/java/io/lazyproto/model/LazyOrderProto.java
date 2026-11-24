@@ -368,9 +368,28 @@ public final class LazyOrderProto {
             }
         }
 
+        public LazyUserProfile copy() {
+            LazyUserProfile c = new LazyUserProfile();
+            c.copyFrom(this);
+            return c;
+        }
+
+        public LazyUserProfile copyFrom(LazyUserProfile src) {
+            copyBaseFrom(src);
+            System.arraycopy(src.slotTapeIdx, 0, this.slotTapeIdx, 0, slotTapeIdx.length);
+            this.userId_ = src.userId_;
+            this.city_ = src.city_;
+            this.cityUtf8Dirty_ = src.cityUtf8Dirty_;
+            this.vipLevel_ = src.vipLevel_;
+            this.score_ = src.score_;
+            this.email_ = src.email_;
+            this.emailUtf8Dirty_ = src.emailUtf8Dirty_;
+            return this;
+        }
+
         @Override public Message getDefaultInstanceForType() { return new LazyUserProfile(); }
         @Override public LazyUserProfile newBuilderForType() { return newBuilder(); }
-        @Override public LazyUserProfile toBuilder() { return this; }
+        @Override public LazyUserProfile toBuilder() { return copy(); }
         @Override public LazyUserProfile build() { return this; }
     }
 
@@ -698,9 +717,28 @@ public final class LazyOrderProto {
             }
         }
 
+        public LazyLineItem copy() {
+            LazyLineItem c = new LazyLineItem();
+            c.copyFrom(this);
+            return c;
+        }
+
+        public LazyLineItem copyFrom(LazyLineItem src) {
+            copyBaseFrom(src);
+            System.arraycopy(src.slotTapeIdx, 0, this.slotTapeIdx, 0, slotTapeIdx.length);
+            this.itemId_ = src.itemId_;
+            this.sku_ = src.sku_;
+            this.skuUtf8Dirty_ = src.skuUtf8Dirty_;
+            this.quantity_ = src.quantity_;
+            this.priceCents_ = src.priceCents_;
+            this.description_ = src.description_;
+            this.descriptionUtf8Dirty_ = src.descriptionUtf8Dirty_;
+            return this;
+        }
+
         @Override public Message getDefaultInstanceForType() { return new LazyLineItem(); }
         @Override public LazyLineItem newBuilderForType() { return newBuilder(); }
-        @Override public LazyLineItem toBuilder() { return this; }
+        @Override public LazyLineItem toBuilder() { return copy(); }
         @Override public LazyLineItem build() { return this; }
     }
 
@@ -987,6 +1025,19 @@ public final class LazyOrderProto {
             int idx = slotTapeIdx[SLOT_USER];
             if (idx >= 0) {
                 user.attachToParent(this, idx, BIT_USER);
+                if (user.rawBuffer() == this.buf
+                        && user.rawOffset() == tapeValueOffset(idx)
+                        && user.rawLength() == tapeValueLength(idx)) {
+                    if (user.isClean()) {
+                        return this;
+                    }
+                    if (user.isSameSizeDirtyOnly() && tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE) {
+                        setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
+                        this.sameSizeDirtyMask |= BIT_USER;
+                        bubbleSameSizeDirtyToParent();
+                        return this;
+                    }
+                }
                 setTapeFlags(idx, FLAG_DIRTY_VAR_SIZE);
             } else {
                 user.attachToParent(this, -1, BIT_USER);
@@ -1405,9 +1456,43 @@ public final class LazyOrderProto {
             }
         }
 
+        public LazyOrderEnvelope copy() {
+            LazyOrderEnvelope c = new LazyOrderEnvelope();
+            c.copyFrom(this);
+            return c;
+        }
+
+        public LazyOrderEnvelope copyFrom(LazyOrderEnvelope src) {
+            copyBaseFrom(src);
+            System.arraycopy(src.slotTapeIdx, 0, this.slotTapeIdx, 0, slotTapeIdx.length);
+            this.orderId_ = src.orderId_;
+            this.buyerName_ = src.buyerName_;
+            this.buyerNameUtf8Dirty_ = src.buyerNameUtf8Dirty_;
+            this.status_ = src.status_;
+            this.updatedAtFixed64_ = src.updatedAtFixed64_;
+            if ((src.decodedMask & BIT_USER) != 0L && src.userView_ != null && !src.userView_.isClean()) {
+                if (this.userView_ == null) this.userView_ = new LazyUserProfile();
+                this.userView_.copyFrom(src.userView_);
+                this.userView_.attachToParent(this, this.slotTapeIdx[SLOT_USER], BIT_USER);
+            } else {
+                // Re-bind lazily on demand from shared buf!
+                this.decodedMask &= ~BIT_USER;
+            }
+            this.itemsList_.reset();
+            this.itemsList_.copyFrom(src.itemsList_, LazyLineItem::copy);
+            this.payload_ = src.payload_;
+            this.payloadDirty_ = src.payloadDirty_;
+            this.authToken_ = src.authToken_;
+            this.authTokenUtf8Dirty_ = src.authTokenUtf8Dirty_;
+            this.traceId_ = src.traceId_;
+            this.traceIdUtf8Dirty_ = src.traceIdUtf8Dirty_;
+            this.totalCents_ = src.totalCents_;
+            return this;
+        }
+
         @Override public Message getDefaultInstanceForType() { return new LazyOrderEnvelope(); }
         @Override public LazyOrderEnvelope newBuilderForType() { return newBuilder(); }
-        @Override public LazyOrderEnvelope toBuilder() { return this; }
+        @Override public LazyOrderEnvelope toBuilder() { return copy(); }
         @Override public LazyOrderEnvelope build() { return this; }
     }
 }

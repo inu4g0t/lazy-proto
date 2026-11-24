@@ -174,6 +174,48 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     protected abstract void resetSlots();
 
+    /**
+     * Shallow-copies the tape index, bitmasks, and raw buffer reference from {@code src} into {@code this}.
+     * The underlying raw {@code byte[] buf} is shared (zero-copy), while mutations on {@code this}
+     * are completely isolated from {@code src} (preserving standard Java {@code toBuilder()} snapshot semantics).
+     */
+    protected void copyBaseFrom(AbstractLazyMessage<?> src) {
+        if (!src.scanned && src.rawLength > 0) {
+            // Scan src once so its reusable tape is populated and shared across any subsequent toBuilder() forks!
+            src.ensureScanned();
+        }
+        this.buf = src.buf;
+        this.rawOffset = src.rawOffset;
+        this.rawLength = src.rawLength;
+        this.scanned = src.scanned;
+        this.tapeCount = src.tapeCount;
+        if (src.tapeCount > 0) {
+            int requiredWords = src.tapeCount << 1;
+            if (this.tape == EMPTY_TAPE || this.tape.length < requiredWords) {
+                this.tape = Arrays.copyOf(src.tape, requiredWords);
+            } else {
+                System.arraycopy(src.tape, 0, this.tape, 0, requiredWords);
+            }
+        } else {
+            this.tapeCount = 0;
+        }
+        this.presentMask = src.presentMask;
+        this.decodedMask = src.decodedMask;
+        this.sameSizeDirtyMask = src.sameSizeDirtyMask;
+        this.varSizeDirtyMask = src.varSizeDirtyMask;
+        this.appendedMask = src.appendedMask;
+        this.hasDeletedEntries = src.hasDeletedEntries;
+        this.cachedSerializedSize = src.cachedSerializedSize;
+    }
+
+    /**
+     * Explicit zero-allocation in-place mutation view for extreme hot paths where snapshot isolation is not needed.
+     */
+    @SuppressWarnings("unchecked")
+    public M toInPlaceBuilder() {
+        return (M) this;
+    }
+
     public final byte[] rawBuffer() {
         return buf;
     }
@@ -627,7 +669,7 @@ public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
 
     @Override
     public Message.Builder clone() {
-        throw new UnsupportedOperationException("clone() is disabled in lazy-proto; use wrap() or toByteArray().");
+        return toBuilder();
     }
 
     @Override
