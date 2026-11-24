@@ -76,15 +76,19 @@ public final class LazyProtobufList<E extends AbstractLazyMessage<E>>
         if (src.appendedCount > 0) {
             this.appendedElements = new Object[src.appendedElements.length];
             for (int i = 0; i < src.appendedCount; i++) {
-                this.appendedElements[i] = elementCopier.apply((E) src.appendedElements[i]);
+                E clonedApp = elementCopier.apply((E) src.appendedElements[i]);
+                clonedApp.attachToParent(host, -1, parentFieldBit);
+                this.appendedElements[i] = clonedApp;
             }
         }
-        // Only clone element views that were actually mutated in src!
+        // Clone element views that were mutated OR replaced in src (check parent tape flag as well as child isClean)!
         if (src.indexed) {
             for (int i = 0; i < src.count; i++) {
                 if (src.elementLoaded[i] && src.elementViews[i] != null) {
                     E srcElem = (E) src.elementViews[i];
-                    if (!srcElem.isClean()) {
+                    int tapeIdx = src.indexToTapeIdx[i];
+                    int tapeFlag = src.host.tapeFlags(tapeIdx);
+                    if (!srcElem.isClean() || tapeFlag != AbstractLazyMessage.FLAG_CLEAN_RAW) {
                         ensureIndexBuilt();
                         E clonedElem = elementCopier.apply(srcElem);
                         clonedElem.attachToParent(host, indexToTapeIdx[i], parentFieldBit);
@@ -94,6 +98,53 @@ public final class LazyProtobufList<E extends AbstractLazyMessage<E>>
                 }
             }
         }
+    }
+
+    public int loadedScannedElementCount() {
+        if (!indexed) return 0;
+        int c = 0;
+        for (int i = 0; i < count; i++) {
+            if (elementLoaded[i]) c++;
+        }
+        return c;
+    }
+
+    public void setElement(int index, E element) {
+        host.ensureScanned();
+        int total = count + appendedCount;
+        if (index < 0 || index >= total) {
+            throw new IndexOutOfBoundsException("Index " + index + " out of bounds for length " + total);
+        }
+        if (index >= count) {
+            element.attachToParent(host, -1, parentFieldBit);
+            appendedElements[index - count] = element;
+            host.onChildVarSizeDirty(-1, parentFieldBit, false);
+            return;
+        }
+        ensureIndexBuilt();
+        int tapeIdx = indexToTapeIdx[index];
+        element.attachToParent(host, tapeIdx, parentFieldBit);
+        elementViews[index] = element;
+        elementLoaded[index] = true;
+        host.onChildVarSizeDirty(tapeIdx, parentFieldBit, false);
+    }
+
+    public void clearAll() {
+        host.ensureScanned();
+        int curr = headTapeIdx;
+        while (curr != AbstractLazyMessage.NO_NEXT_IDX) {
+            host.setTapeFlags(curr, AbstractLazyMessage.FLAG_DELETED);
+            curr = host.tapeNextIdx(curr);
+        }
+        for (int i = 0; i < count && i < elementViews.length; i++) {
+            elementLoaded[i] = false;
+            elementViews[i] = null;
+        }
+        headTapeIdx = AbstractLazyMessage.NO_NEXT_IDX;
+        tailTapeIdx = AbstractLazyMessage.NO_NEXT_IDX;
+        count = 0;
+        indexed = false;
+        appendedCount = 0;
     }
 
     /**
@@ -200,6 +251,7 @@ public final class LazyProtobufList<E extends AbstractLazyMessage<E>>
         } else if (appendedCount >= appendedElements.length) {
             appendedElements = Arrays.copyOf(appendedElements, appendedElements.length << 1);
         }
+        element.attachToParent(host, -1, parentFieldBit);
         appendedElements[appendedCount++] = element;
     }
 

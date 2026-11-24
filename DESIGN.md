@@ -16,9 +16,10 @@
 6. [复用输入的序列化引擎：四级加速路径与算法伪代码](#6-复用输入的序列化引擎四级加速路径与算法伪代码)
 7. [全过程字节级推演示例（Byte-by-Byte Walkthrough）](#7-全过程字节级推演示例byte-by-byte-walkthrough)
 8. [不同编程语言对性能的影响与针对性架构设计（C++ / Rust / Go / Java）](#8-不同编程语言对性能的影响与针对性架构设计c--rust--go--java)
-9. [Java 版深度实现与 `protobuf-java` 接口兼容架构（受控异常裁剪方案）](#9-java-版深度实现与-protobuf-java-接口兼容架构受控异常裁剪方案)
-10. [关键边界与 Protobuf Wire 语义完备性](#10-关键边界与-protobuf-wire-语义完备性)
-11. [模块划分与分阶段实施路线图](#11-模块划分与分阶段实施路线图)
+9. [Java 版 Architecture v2：只读视图与可变 Builder 分离架构（受控异常裁剪方案）](#9-java-版-architecture-v2只读视图与可变-builder-分离架构受控异常裁剪方案)
+10. [关键边界、显式槽位状态机与 Protobuf Wire 语义契约](#10-关键边界显式槽位状态机与-protobuf-wire-语义契约)
+11. [六维验证体系设计（Differential Oracle + 状态机 Fuzzing + 畸形流语料 + 白盒路径断言）](#11-六维验证体系设计differential-oracle--状态机-fuzzing--畸形流语料--白盒路径断言)
+12. [模块划分与实测基准报告](#12-模块划分与实测基准报告)
 
 ---
 
@@ -498,466 +499,238 @@ Java 是从 `lazy-proto` 架构中**获益幅度最大**（相比官方 `protobu
 
 ---
 
-## 9. Java 版深度实现与 `protobuf-java` 接口兼容架构（受控异常裁剪方案）
+## 9. Java 版 Architecture v2：只读视图与可变 Builder 分离架构（受控异常裁剪方案）
 
-在实际 Java 工程落地中，一个核心诉求是：**能否在不修改（或极少修改）现有业务代码的前提下，兼容官方 `com.google.protobuf` 的核心接口，而对破坏 Lazy/Zero-Copy 的方法直接抛出 `UnsupportedOperationException`？**
+在第一代设计（Design v1）的工程实践中，我们发现：**试图将 `Message` 与 `Builder` 强行合并为同一个对外可变的对象，并在子对象上通过单 `parent` 指针向上冒泡，会与 Java Protobuf 的不可变值语义（Immutable Snapshot Semantics）产生四大结构性矛盾**：
+1. **`build()` 快照失真**：若 `Message` 自身暴露 `setXxx()` 或 `msg.getUser()` 返回可变对象，调用方在 `build()` 之后继续修改同一 `Builder`（或通过 `msg.getUser().setCity()` 修改子视图），会直接篡改已构建完成的 `Message` 快照。
+2. **“子对象自身是否 Clean”与“父槽位是否被替换”概念混淆**：当调用 `builder.setUser(LazyUserProfile.parseFrom(otherBytes))` 传入一个外部干净子对象时，该子对象相对于自己的 `otherBytes` 是 `isClean() == true`，但相对于父消息的 `buf` 却是**外来替换物**。用 `!child.isClean()` 判断父槽位是否需要在 `toBuilder()` 时复制，会导致外来干净子对象在 fork 时丢失或触发 NPE。
+3. **跨层尺寸缓存 (`cachedSerializedSize`) 失效脆弱性**：当同一个对象既能被读取缓存尺寸、又能被原地反复修改甚至“恢复回原干净子对象”时，任何一条未向上冒泡的路径都会导致父层 `cachedSerializedSize` 陈旧，引发尾部零字节填充或 `ArrayIndexOutOfBoundsException`。
+4. **有 Schema 与无 Schema (`ProtoDocument`) 扫描期语义混同**：在无 Schema 的 `ProtoDocument` 中，扫描期无法区分重复出现的 Tag 是单值覆盖（Last-Write-Wins）、单值子消息分段合并（Merge）还是 `unpacked repeated` 列表，扫描期提前做 `SHADOWED` 标记会导致 `unpacked repeated` 元素被误删。
 
-答案是：**完全可行，且可以通过“Message 与 Builder 视图合一（Unified Self-Builder Pattern）”消灭 `toBuilder().setXxx().build()` 的对象分配**。
+为此，**Architecture v2** 对 Java 版进行了彻底的职责解耦与状态机重构。
 
 ---
 
-### 9.1 官方 `protobuf-java` 的接口层次拆解
-
-当官方 `protoc` 编译 `message Order` 时，生成的类型体系如下：
+### 9.1 核心架构重构：只读 `LazyMessage` 视图 + 独占修改权的 `Builder`
 
 ```mermaid
 classDiagram
-    class MessageLiteOrBuilder {
-        <<interface>>
-        +isInitialized() boolean
-        +getDefaultInstanceForType() MessageLite
-    }
-    class MessageOrBuilder {
-        <<interface>>
-        +getDescriptorForType() Descriptor
-        +getAllFields() Map
-        +hasField(FieldDescriptor) boolean
-        +getField(FieldDescriptor) Object
-        +getUnknownFields() UnknownFieldSet
-    }
     class OrderOrBuilder {
         <<interface>>
         +getOrderId() long
-        +getBuyer() String
-        +getBuyerBytes() ByteString
-        +getStatus() int
-        +hasUser() boolean
-        +getUser() User
-        +getUserOrBuilder() UserOrBuilder
-        +getItemsList() List~Item~
-        +getItems(int) Item
-        +getItemsCount() int
+        +getBuyerName() String
+        +getBuyerNameBytes() ByteString
+        +getUser() LazyUserProfile
+        +getUserOrBuilder() UserProfileOrBuilder
+        +getItemsList() List~LazyLineItem~
     }
-    class MessageLite {
-        <<interface>>
-        +writeTo(CodedOutputStream) void
-        +writeTo(OutputStream) void
-        +toByteArray() byte[]
-        +toByteString() ByteString
-        +getSerializedSize() int
-        +newBuilderForType() Builder
+    class LazyOrderEnvelope {
+        <<Read-Only Lazy View (Implements Message)>>
+        -byte[] buf
+        -long[] tape
+        -long decodedMask
+        -int cachedSerializedSize
+        +parseFrom(byte[]) LazyOrderEnvelope
+        +getOrderId() long
+        +getUser() LazyUserProfile
+        +getItems(int) LazyLineItem
         +toBuilder() Builder
+        +toByteArray() byte[]
+        +getSerializedSize() int
     }
-    class Message {
-        <<interface>>
-    }
-    class Message_Builder["Message.Builder"] {
-        <<interface>>
-        +build() Message
-        +buildPartial() Message
-        +clear() Builder
-        +mergeFrom(...) Builder
-        +setField(FieldDescriptor, Object) Builder
+    class Builder["LazyOrderEnvelope.Builder"] {
+        <<Mutable State Machine (Implements Message.Builder)>>
+        -LazyOrderEnvelope target
+        -boolean built
+        -byte[] slotStates
+        +setStatus(int) Builder
+        +getUserBuilder() LazyUserProfile.Builder
+        +setUser(LazyUserProfile) Builder
+        +getItemsBuilder(int) LazyLineItem.Builder
+        +build() LazyOrderEnvelope
+        +clone() Builder
     }
 
-    MessageLiteOrBuilder <|-- MessageOrBuilder
-    MessageOrBuilder <|-- OrderOrBuilder
-    MessageLiteOrBuilder <|-- MessageLite
-    MessageLite <|-- Message
-    MessageOrBuilder <|-- Message
-    MessageOrBuilder <|-- Message_Builder
+    OrderOrBuilder <|.. LazyOrderEnvelope
+    OrderOrBuilder <|.. Builder
+    LazyOrderEnvelope --> Builder : toBuilder() (Shallow Tape Fork)
+    Builder --> LazyOrderEnvelope : build() (Ownership Transfer + Freeze)
 ```
 
-#### 关键洞察：
-1. **`OrderOrBuilder` 是纯接口（Interface）**：包含了该消息所有字段的强类型只读 Getter（包括 `getXxx()`、`getXxxBytes()`、`getXxxOrBuilder()`、`getXxxList()`）。
-2. **`Message` 与 `Message.Builder` 没有任何方法签名冲突**：两者共同继承自 `MessageOrBuilder`，`Message` 负责序列化输出（`writeTo`、`toByteArray`、`toBuilder`），`Message.Builder` 负责变更与构建（`mergeFrom`、`clear`、`build`）。
-3. **所有反射方法都集中定义在 `MessageOrBuilder` 和 `Message.Builder` 上**：只要我们在抽象基类 `AbstractLazyMessage` 中将这些反射方法统一实现为 `throw new UnsupportedOperationException("Reflection is disabled in lazy-proto")`（Java `default` 方法），生成类就能 100% 合法实现 `com.google.protobuf.Message`、`Message.Builder` 和 `OrderOrBuilder`！
+#### Architecture v2 的四条铁律：
+
+1. **`LazyMessage` 对外严格只读（Immutable Snapshot Contract）**：
+   - `LazyOrderEnvelope`、`LazyUserProfile`、`LazyLineItem` 实现 `com.google.protobuf.Message` 与对应的 `XxxOrBuilder`；
+   - **公开 API 仅提供 Getter 与序列化方法，不暴露公开的 `setXxx()` / `clearXxx()`**（所有内部状态变更方法均为包级私有或仅由 `Builder` 驱动）。
+   - `msg.getUser()` 返回只读的 `LazyUserProfile`；`msg.getItems(i)` 返回只读的 `LazyLineItem`。
+   - **架构收益**：
+     - 一旦 `LazyMessage` 构建完成（无论是 `parseFrom` 还是 `builder.build()`），其逻辑值永不改变，`cachedSerializedSize` 计算一次后**终身有效，永不失效**！
+     - 任意只读 `LazyUserProfile` 实例可以被多个 `OrderEnvelope.Builder` 通过 `b1.setUser(u); b2.setUser(u);` **零拷贝安全共享（DAG Sharing）**，无需克隆 `u`，更无需修改 `u.parent` 指针！
+2. **`Builder` 独占修改权 + 所有权转移（Ownership Transfer & Copy-on-Post-Build-Write）**：
+   - 所有修改必须通过 `Builder`（`order.toBuilder()` 或 `Order.newBuilder()`）进行：
+     - `builder.setStatus(2)`
+     - `builder.getUserBuilder().setCity("BJ")`
+     - `builder.setUser(externalUser)`
+     - `builder.getItemsBuilder(42).setQuantity(999)`
+   - **正常路径零额外拷贝**：当调用 `LazyOrderEnvelope m1 = builder.build()` 时，`builder` 将 `this.built = true` 置位（并递归冻结所有已打开的子 `Builder`），直接将内部持有的 `LazyOrderEnvelope` 引用返回给 `m1`（**0 额外拷贝**）。
+   - **Build 后二次修改自动写时拷贝（Copy-on-Post-Build-Write）**：若调用方在 `m1 = builder.build()` 之后**继续修改同一个 `builder` 或之前持有的 `userBuilder`**，`ensureMutable()` 检测到 `built == true`，立即在后台浅拷贝出一份新的 `LazyOrderEnvelope`（并重绑子 `Builder`），确保已发布的 `m1` **100% 物理隔离、绝不被污染**！
+3. **保留显式零分配热路径（Reusable In-Place Mutator / `toInPlaceBuilder()`）**：
+   - 针对追求极致 `0 Bytes/op` 的流式网关热路径（调用方明确知晓当前消息为单线程独占且无需保留旧快照），提供显式 `reusableMsg.wrap(bytes)` + 原地修改接口，在文档与基准测试中与默认隔离模式（`toBuilder()`）严格分列口径。
 
 ---
 
-### 9.2 两种集成兼容模式
+## 10. 关键边界、显式槽位状态机与 Protobuf Wire 语义契约
 
-#### 模式 A：源码级同名无缝替换（Drop-in Codegen Replacement，推荐）
-由 `lazy-proto` 代码生成器直接生成与官方 `protoc` **相同包名、相同类名、相同公开方法签名** 的 `Order`、`Order.Builder` 与 `OrderOrBuilder`：
-- 业务现有的以下代码**一行不改即可直接编译运行**：
-  ```java
-  // 1. O(1) 零扫描包装！不解析任何字段
-  Order order = Order.parseFrom(bytes);
+### 10.1 显式父槽位状态机（Explicit Parent Slot State Machine）
 
-  // 2. 首次访问触发单层 ShallowScan，仅解码 orderId
-  if (order.getOrderId() > 1000) {
-      // 3. toBuilder() 执行轻量级浅拷贝 (Shallow Fork)：
-      //    仅复制顶层壳对象与紧凑的 long[] tape 索引 (~2.5KB)，底层 12.4KB byte[] 与 100 个未解析列表项 100% 零拷贝共享！
-      //    既严格保证了原 order 快照不被篡改（符合 Java 标准语义），又比官方 toBuilder() 快 10.5 倍、省 95.5% 内存！
-      //    （若追求极致 0 分配，也可显式调用 order.toInPlaceBuilder() 原地修改）
-      order = order.toBuilder()
-          .setStatus(2)
-          .build();
-  }
+为了彻底根除“外来 clean 子对象被当成未修改原切片”以及“恢复原对象后状态与缓存不一致”的缺陷，父消息中的每个嵌套子消息槽位（如 `SLOT_USER` 或列表元素槽位）不再依赖 `!child.isClean()` 推断，而是由显式状态机驱动：
 
-  // 6. Fast-Path 1 原地覆写或 Fast-Path 2 连续原始区间拼接写出！
-  byte[] output = order.toByteArray();
-  ```
-- **语义安全（`toBuilder()` 浅拷贝）vs 极致零分配（`toInPlaceBuilder()` 原地修改）的双模式设计**：
-  - **默认 `toBuilder()`（Shallow Copy-on-Write，符合 Java 不可变快照语义）**：
-    - 在标准 Java Protobuf 中，业务代码常有 `Order branchA = base.toBuilder().setStatus(2).build();` 并期望 `base` 保持原值不变。
-    - 因此，`toBuilder()` 默认执行 **轻量浅拷贝（`copy()`）**：共享底层 `byte[] buf`（0 字节复制），仅拷贝顶层 `long[] tape` 索引数组与 64-bit 状态位图，未修改的子消息与 100 个列表元素依然留在 Tape 中不克隆、不反序列化。
-    - 实测在 12.4KB / 100 子项消息上，`toBuilder()` 浅拷贝仅分配 `2,560 Bytes`（官方分配 `57,248 Bytes`，节省 **95.5%** 内存），耗时 `2,003 ns`（比官方快 **10.49x**）。
-  - **显式 `toInPlaceBuilder()`（0 分配原地修改模式）**：
-    - 对于明确不需要保留旧引用的网关/流式热路径，调用 `order.toInPlaceBuilder()` 直接返回 `this`，实现 **0 字节堆分配（`0 Bytes/op`）** 与 **18.86x** 加速！
+```mermaid
+stateDiagram-v2
+    [*] --> SLOT_RAW_UNTOUCHED : parseFrom / wrap
+    SLOT_RAW_UNTOUCHED --> SLOT_READ_ONLY_VIEW : 调用 getUser() (仅懒绑定原切片)
+    SLOT_RAW_UNTOUCHED --> SLOT_IN_PLACE_BUILDER : 调用 getUserBuilder()
+    SLOT_READ_ONLY_VIEW --> SLOT_IN_PLACE_BUILDER : 调用 getUserBuilder()
+    SLOT_RAW_UNTOUCHED --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
+    SLOT_READ_ONLY_VIEW --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
+    SLOT_IN_PLACE_BUILDER --> SLOT_REPLACED_EXTERNAL : 调用 setUser(otherUser)
+    SLOT_REPLACED_EXTERNAL --> SLOT_RAW_UNTOUCHED : setUser(origSliceCleanUser) 恢复原切片!
+    SLOT_IN_PLACE_BUILDER --> SLOT_RAW_UNTOUCHED : clear/回滚至原切片干净状态
+    SLOT_RAW_UNTOUCHED --> SLOT_CLEARED : 调用 clearUser()
+    SLOT_IN_PLACE_BUILDER --> SLOT_CLEARED : 调用 clearUser()
+    SLOT_REPLACED_EXTERNAL --> SLOT_CLEARED : 调用 clearUser()
+```
 
-#### 模式 B：与第三方 Jar 中的官方 `final class Order` 共存
-当 `Order` 位于不可修改的二方/三方 Jar 包中时（由于官方生成的 `Order` 是 `final class` 无法继承）：
-- `lazy-proto` 生成 `LazyOrder implements OrderOrBuilder, com.google.protobuf.Message, com.google.protobuf.Message.Builder`。
-- 所有接收 `OrderOrBuilder`、`Message`、`MessageLite` 的通用框架（如日志打印、路由鉴权、gRPC 自定义 Marshaller）可直接传入 `LazyOrder`。
-- 提供了极速零拷贝互转桥接：
-  - `LazyOrder.wrap(Order standardOrder)` / `lazyOrder.toStandardProto()`（仅在必须跨越 `final Order` 强类型边界时才通过 `UnsafeByteOperations` 转换）。
-
----
-
-### 9.3 Java 四大核心接口类型的 Lazy 与 Zero-Copy 攻克方案
-
-要在实现官方接口签名（返回 `ByteString`、`String`、`List<T>`、嵌套 `SubMessage`）的同时不丧失 Lazy 与零拷贝特性，必须针对以下四个 Java 类型做专门设计：
-
-#### 1. `ByteString` 零拷贝桥接（利用 `UnsafeByteOperations`）
-- **问题**：官方接口 `ByteString getPayloadBytes()`、`toByteString()`、`parseFrom(ByteString)` 全部使用 `com.google.protobuf.ByteString`。如果用 `ByteString.copyFrom(buf, off, len)`，每次都会发生 `byte[]` 内存拷贝。
-- **解法**：利用 `protobuf-java` 官方内置的后门类 **`com.google.protobuf.UnsafeByteOperations`**：
-  - **读取 (`getXxxBytes()` / `toByteString()`)**：
-    调用 `UnsafeByteOperations.unsafeWrap(this.buf, valOff, valLen)`！该方法直接返回一个包裹原 `byte[]` 子区间的 `BoundedByteString` 视图，**0 字节数组拷贝**！
-  - **解析 (`parseFrom(ByteString data)`)**：
-    通过 `UnsafeByteOperations.unsafeWriteTo(data, byteOutputAdapter)` 直接截获 `ByteString` 内部持有的底层 `(byte[] array, int offset, int length)` 引用并调用 `wrap(array, offset, length)`，**0 字节数组拷贝**！
-
-#### 2. `String` 延迟物化与“已读未改不回写”
-- **问题**：官方接口 `String getBuyer()` 必须返回 `java.lang.String`，而 JVM 的 `String` 构造必然发生一次 UTF-8 解码与拷贝。
-- **解法**：
-  1. **不读不解码**：未调用 `getBuyer()` 时，不分配 `String`，序列化直接拷贝 `FieldTape` 中的原始 `[tagOffset, recordEnd)`。
-  2. **已读缓存但保持 `CLEAN_RAW`**：调用 `getBuyer()` 时解码一次并缓存在 `this.buyer_`（置 `decodedMask |= BIT_BUYER`），**但绝不置 `dirtyMask`**！后续序列化时，看到 `dirtyMask` 为 0，**直接忽略 `this.buyer_`，依然从原始 `buf` 拷贝 `[tagOffset, recordEnd)`**，省去 `String -> UTF-8` 的二次编码！
-  3. **同名扩展零分配接口**：在实现标准 `String getBuyer()` 和 `ByteString getBuyerBytes()` 的同时，额外生成 `Utf8Slice getBuyerSlice()`（实现 Java 标准 `CharSequence` 接口），在需要高性能比对（如 `order.getBuyerSlice().contentEquals("alice")`）时实现 0 对象分配。
-
-#### 3. `repeated` 列表接口 `List<T> getItemsList()` 的按需懒加载视图
-- **问题**：官方接口要求返回 `java.util.List<Item> getItemsList()` 和 `List<Integer> getTagsList()`。如果返回 `ArrayList` 并在调用时一次性解析全部元素，遇到包含 500 个元素的列表就会瞬间产生 500 次对象分配与反序列化。
-- **解法**：实现自定义的 **`LazyProtobufList<E> extends AbstractList<E> implements RandomAccess`**：
-  - **底层存储**：直接绑定父消息的 `FieldTape` 中该 `fieldNumber` 的静态单链表（由 `nextTapeIdx` 串联）。
-  - **懒索引表**：首次随机访问 `list.get(i)` 时，将静态链表中的 `tapeIdx` 提取到紧凑的 `int[] elementTapeIndices` 原生数组中，耗时仅几十纳秒，**不解析任何 `Item` 元素**。
-  - **单元素按需物化**：当调用 `list.get(3)`（或 `order.getItems(3)`）时，才从 `elementTapeIndices[3]` 取出 `[valOff, recordEnd)` 绑定到第 3 个 `LazyItem` 实例上！其余 499 个未被访问的元素永远处于未解析状态！
-  - **局部修改列表元素的区间拼接（Span Splicing on Repeated Elements）**：
-    - 假设用户修改了 500 个元素中的第 3 个元素：`order.getItems(3).toBuilder().setPrice(99);`
-    - 因为在 Protobuf Wire Format 中，非 Packed 的 `repeated Item` 本质上就是父消息 `FieldTape` 中的 500 条顶层 `TapeEntry`！
-    - 序列化父消息时：
-      - 元素 `0..2` 状态为 `CLEAN_RAW` $\implies$ **合并为 1 次 `System.arraycopy`**！
-      - 元素 `3` 状态为 `DIRTY` $\implies$ **仅重编码第 3 个元素**（且第 3 个元素内部未改的字段也走 Span Splicing）！
-      - 元素 `4..499` 状态为 `CLEAN_RAW` $\implies$ **合并为 1 次 `System.arraycopy`**！
-    - **效果**：修改 500 个复杂对象列表中的 1 个元素，其余 499 个元素既不需要反序列化，也不需要重序列化，2 次内存块拷贝即可完成！
-
-#### 4. 嵌套子消息修改的两种标准 Java 惯用法兼容
-Java 开发者修改嵌套子消息通常有两种写法，`lazy-proto` 均能识别并保持局部增量拼接：
-- **写法一（推荐）**：`order.toBuilder().getUserBuilder().setName("bob");`
-  - `getUserBuilder()` 直接返回绑定了原切片的子消息视图，并将其在父消息 `Order` 中的状态置为 `CHILD_DIRTY`。
-- **写法二（传统不可变链式写法）**：
-  ```java
-  User newUser = order.getUser().toBuilder().setName("bob").build();
-  order = order.toBuilder().setUser(newUser).build();
-  ```
-  - 在 `order.getUser()` 返回子视图 `this.user_` 后，`this.user_.toBuilder().setName("bob").build()` 原地修改 `this.user_` 并返回 `this.user_`。
-  - 当外层调用 `setUser(newUser)` 时，检测到 `newUser == this.user_`（即传入的正是当前父消息挂载的原地子视图），**不会将整个 `User` 视为外部新对象全量重编码，而是保持 `CHILD_DIRTY` 增量拼接状态**，`User` 内部未修改的其他字段依然直接复用原输入字节！
-  - 若传入的 `newUser` 确实是来自另一个消息的外部 `LazyUser` 实例，则直接调用 `newUser.writeSplicedTo(out)`，同样能复用 `newUser` 自己持有的底层原始字节切片！
-
----
-
-### 9.4 Java 接口方法完整兼容与异常裁剪矩阵
-
-我们将 `com.google.protobuf.Message`、`Message.Builder`、`XxxOrBuilder` 及 `java.lang.Object` 的所有方法划分为 **完整支持并加速（✅）**、**防呆轻量实现（🛡️）** 与 **直接抛 `UnsupportedOperationException`（❌）** 三类：
-
-| 方法类别 | 具体方法签名 | 兼容策略 | 行为与设计理由 |
+| 父槽位状态 | 物理含义 | `toBuilder()` / `clone()` 行为 | 序列化 (`writeSplicedTo`) 行为 |
 | :--- | :--- | :--- | :--- |
-| **反序列化入口** | `parseFrom(byte[])`<br>`parseFrom(byte[], int, int)`<br>`parseFrom(ByteString)`<br>`parseFrom(ByteBuffer)`<br>`parseFrom(InputStream)`<br>`mergeFrom(...)` | ✅ **支持并极速化** | `byte[]` / `ByteString` / Heap `ByteBuffer` 均走 **$O(1)$ 零拷贝 `wrap()`**，不扫描不解析；`InputStream` 一次性读入紧凑 `byte[]` 后 `wrap()` |
-| **序列化出口** | `toByteArray()`<br>`toByteString()`<br>`writeTo(CodedOutputStream)`<br>`writeTo(OutputStream)`<br>`getSerializedSize()` | ✅ **支持并复用输入** | 自动走 Fast-Path 0（直通）、Fast-Path 1（同长原地修补）、Fast-Path 2/3（连续原始区间合并拼接） |
-| **强类型字段读** | `hasXxx()`<br>`getXxx()`<br>`getXxxBytes()`<br>`getXxxOrBuilder()`<br>`getXxxList()` / `getXxxCount()` / `getXxx(int)` | ✅ **支持并按需懒加载** | 首次调用触发当前层 `ShallowScanner`；仅解码被访问的字段并缓存；列表返回 `LazyProtobufList` |
-| **强类型字段写** | `setXxx(...)`<br>`clearXxx()`<br>`getXxxBuilder()`<br>`addXxx(...)` / `addAllXxx(...)` | ✅ **支持并记录脏位图** | 自动比对新旧编码长度区分 `SAME_SIZE_DIRTY` 与 `VAR_SIZE_DIRTY`，向上冒泡脏标记 |
-| **生命周期与 Builder** | `toBuilder()` / `newBuilder()`<br>`build()` / `buildPartial()`<br>`clear()`<br>`isInitialized()`<br>`getParserForType()` | ✅ **支持（零分配合一）** | `toBuilder()` 与 `build()` 零分配返回自身视图；`clear()` 等同于 `reset()` 归还状态；`isInitialized()` 默认返回 `true` |
-| **日志与调试防呆** | `toString()` | 🛡️ **防呆轻量摘要** | **绝不调用官方 `TextFormat` 反射打印全树**（防止 `log.info("{}", msg)` 导致线上 CPU 飙升），仅输出 $O(1)$ 状态摘要如 `LazyOrder[rawLen=1014, scanned=true, dirty=0x4]`；另提供显式 `toDebugString()` |
-| **对象值相等与哈希** | `equals(Object)`<br>`hashCode()` | ❌ **抛 `UnsupportedOperationException`** | 语义相等要求全树递归反序列化与 Map 排序，彻底违背 Lazy 原则；改用显式 `rawBytesEquals(other)` 或比对业务 ID |
-| **Descriptor 与反射读** | `getDescriptorForType()`<br>`getAllFields()`<br>`hasField(FieldDescriptor)`<br>`getField(FieldDescriptor)`<br>`getRepeatedField(FieldDescriptor, int)`<br>`getRepeatedFieldCount(FieldDescriptor)`<br>`getOneofFieldDescriptor(OneofDescriptor)` | ❌ **抛 `UnsupportedOperationException`** | 砍掉体积庞大的 `Descriptor` 元数据表与标量自动装箱（Boxing）；动态读取改用零装箱的 `getDynamicView().getInt64(fieldNumber)` |
-| **反射写** | `setField(FieldDescriptor, Object)`<br>`clearField(FieldDescriptor)`<br>`addRepeatedField(FieldDescriptor, Object)`<br>`newBuilderForField(FieldDescriptor)`<br>`getFieldBuilder(FieldDescriptor)` | ❌ **抛 `UnsupportedOperationException`** | 消除 `FieldAccessorTable` 反射分派开销 |
-| **UnknownFieldSet 对象操作** | `getUnknownFields()`<br>`setUnknownFields(UnknownFieldSet)`<br>`mergeUnknownFields(UnknownFieldSet)` | ❌ **抛 `UnsupportedOperationException`** | **未知字段已在 `FieldTape` 中作为 `CLEAN_RAW` 切片被 100% 自动保留并透传**，无需解析为 `UnknownFieldSet` 的 `TreeMap` 对象 |
+| **`SLOT_RAW_UNTOUCHED`** | 从未读取也未修改 | 仅复制父 `FieldTape`，不分配子对象 | 直接随父 `FieldTape` 连续干净区间整块 `arraycopy` |
+| **`SLOT_READ_ONLY_VIEW`** | 仅调用过 `getUser()` 读取，未修改 | 新副本重置该槽位为 `SLOT_RAW_UNTOUCHED`（按需重绑共享 `buf`） | 直接随父 `FieldTape` 连续干净区间整块 `arraycopy` |
+| **`SLOT_IN_PLACE_BUILDER`** | 通过 `getUserBuilder()` 基于父原切片做了原地修改 | **深拷贝该子 Builder / 子视图** 并重绑到新父副本 | 若子级仅同长修改则走 **Fast-Path 1 原地修补**；否则走 **Fast-Path 2 子级增量拼接** |
+| **`SLOT_REPLACED_EXTERNAL`** | 通过 `setUser(extUser)` 替换为外部构建或外部解析的 `LazyUserProfile` | **必须保留并复制 `extUser` 引用**（即便 `extUser.isClean() == true`！） | 父级对应 Tape 条目标为 `DIRTY_VAR_SIZE`，写出 `extUser` 的完整字节（`extUser` 内部仍走自己的 Fast-Path 0/1/2！） |
+| **`SLOT_CLEARED`** | 调用了 `clearUser()` | 复制 `SLOT_CLEARED` 状态与 `FLAG_DELETED` | 跳过父 `FieldTape` 中该字段的所有分段 |
+
+> **尺寸缓存一致性定理**：任何导致父槽位状态发生转移的动作（包括从 `SLOT_IN_PLACE_BUILDER` 或 `SLOT_REPLACED_EXTERNAL` 重新 `setUser(origCleanUser)` 回到 `SLOT_RAW_UNTOUCHED`），**一律强制执行 `invalidateSizeCacheUpward()`（将当前节点及所有祖先节点的 `cachedSerializedSize` 置为 `-1`）**。
 
 ---
 
-### 9.5 Java 生成类与基类代码结构示例
+### 10.2 `FieldTape` 扫描与同名 Tag 链表的三分语义（解耦静态 Schema 与动态 `ProtoDocument`）
 
-#### 1. 抽象基类 `AbstractLazyMessage`（统一拦截不支持的接口并管理 `FieldTape`）
+在 Protobuf 二进制流中，同一个 `fieldNumber` 可能出现多次。`ShallowScanner` 与上层视图必须严格按以下规则解耦：
 
-```java
-package io.lazyproto.runtime;
+1. **静态生成类（Schema 已知）**：
+   - **`onScanField` 强制 WireType 校验**：每个已知 `fieldNumber` 必须首先核对 `wireType == EXPECTED_WIRE_TYPE`。若不匹配（例如字段 `#1 int64` 却收到 `WIRETYPE_FIXED64` 或 `WIRETYPE_LENGTH_DELIMITED`），**严禁写入 `slotTapeIdx`**，必须直接 `return`，将其作为未知字段保留在 `FieldTape` 中以 `FLAG_CLEAN_RAW` 原样透传。
+   - **单值标量/字符串字段 (`singular scalar / string / bytes`)**：遵循 **Last-Write-Wins**。扫描到后出现的同名合法记录时，将 `slotTapeIdx[slot]` 指向的前一条记录标记为 `FLAG_SHADOWED`，并更新 `slotTapeIdx[slot] = currentTapeIdx`。
+   - **单值嵌套子消息 (`singular message`)**：遵循 **Split Sub-Message Merge**。扫描到多段 `#5 user` 时，**绝不将前序分段标为 `SHADOWED`**，而是通过 `TapeEntry.nextTapeIdx` 将所有分段按出现顺序串成单链表（`slotTapeIdx[SLOT_USER]` 指向首段，`userTailTapeIdx` 指向尾段）：
+     - 若未访问且未修改：所有分段保持 `FLAG_CLEAN_RAW` 原样透传；
+     - 若调用 `getUser()` / `getUserBuilder()`：通过 `wrapMultiSegments()` 依次扫描链表中各分段并合并到子视图的 `FieldTape` 中；
+     - 若子视图发生修改：仅在**该子视图自身 `isMultiSegment() == true`** 时，才将父 `FieldTape` 中该子消息的前序分段标为 `FLAG_SHADOWED`、尾分段标为 `FLAG_DIRTY_VAR_SIZE`，在尾分段位置一次性写出合并后的完整子消息。
+   - **重复字段 (`repeated message / scalar`)**：同样通过 `nextTapeIdx` 串联所有元素，但该链表代表独立元素序列 `0..N-1`，修改第 `k` 个元素时仅更新 `indexToTapeIdx[k]` 对应的单条 `TapeEntry`（`child.isMultiSegment() == false`，绝不触发多段折叠！）。
 
-import com.google.protobuf.*;
-import java.io.IOException;
-import java.util.List;
-import java.util.Map;
+2. **动态无 Schema 类（`ProtoDocument`）**：
+   - **扫描期零假设（Zero-Assumption Scan）**：`ProtoDocument.onScanField` **绝不将任何重复 Tag 标记为 `FLAG_SHADOWED`**！所有记录保持 `FLAG_CLEAN_RAW`，从而保证未触碰的 `unpacked repeated` 标量字段在修改其他字段后依然 **100% 完整保留，绝不发生误裁剪**。
+   - **操作期按语义消歧**：
+     - 读取单值 `getInt32(f)` / `getString(f)`：返回最后一条匹配 `fieldNumber` 且 `wireType` 合法的记录；
+     - 读取子消息 `at(f)`：自动收集所有 `fieldNumber == f && wireType == LEN` 的分段并合并为多段子文档视图；
+     - 写入单值 `setInt32(f, v)` / `setString(f, v)`：若原 Tape 中存在 `f`，将最后一条更新为新值并将前序同名记录标为 `FLAG_SHADOWED`；若原 Tape 中不存在 `f`（**缺字段插入**），写入独立的 `appendedFields` 表并在序列化尾部追加输出；
+     - 重复 `wrap()` 隔离：`resetSlots()` 使用 `Arrays.fill(directTapeIdx, -1)` 完整清空 `1..64`（含 `#64`）槽位，并清空 `mutatedBytes`、`childDocs` 与 `appendedCount`，读取脏值前强制校验 `tapeFlags(idx)`。
 
-public abstract class AbstractLazyMessage<M extends AbstractLazyMessage<M>>
-        implements com.google.protobuf.Message, com.google.protobuf.Message.Builder {
+---
 
-    // 底层原始字节缓冲切片
-    protected byte[] buf;
-    protected int rawOffset;
-    protected int rawLength;
+### 10.3 明确声明的三大设计边界契约
 
-    // 扁平 128-bit FieldTape (每条记录占 2 个 long: tape[i*2], tape[i*2+1])
-    protected long[] tape = new long[32]; // 初始容量 16 个字段，按需 2x 扩容并永久复用
-    protected int tapeCount;
-    protected boolean scanned;
+1. **按需延迟校验契约（Lazy Validation Contract）**：
+   - `parseFrom(bytes)` 仅做 $O(1)$ 切片引用绑定；
+   - `ShallowScanner` 仅校验当前被访问层级的 Tag 合法性（如 `fieldNumber != 0`、`wireType` 合法、Length 不越界、Varint 不截断）；
+   - **未被访问的 `WIRETYPE_LENGTH_DELIMITED` 子消息内部净荷不做递归预校验，并在未修改序列化时原样透传**。若业务要求在入口处做全树合法性校验，可显式调用 `msg.validateDeep()`。
+2. **原始编码保真契约（Raw Wire Fidelity）**：
+   - 对于未被修改的字段，即使原始输入使用了非规范编码（如 Overlong Varint 或分段传输的子消息），序列化输出也优先保持原始字节不变；对于被修改的字段，统一按长度对比 `oldWireValueLen == newCanonicalEncodedLen` 决定走 Fast-Path 1 还是 Fast-Path 2。
+3. **受控异常裁剪契约（Fail-Fast Unsupported Contract）**：
+   - `equals(Object)`、`hashCode()`、`Descriptor` 反射读写及 `UnknownFieldSet` 对象提取统一抛出 `UnsupportedOperationException`；`toString()` 仅输出 $O(1)$ 状态摘要，绝不触发未读字段反序列化。
 
-    // 64-bit 状态位图
-    protected long presentMask;
-    protected long decodedMask;
-    protected long sameSizeDirtyMask;
-    protected long varSizeDirtyMask;
-    protected int cachedSerializedSize = -1;
+---
 
-    // 父消息指针与在父消息中的字段位（用于脏标记向上冒泡）
-    protected AbstractLazyMessage<?> parent;
-    protected long parentFieldBit;
+## 11. 六维验证体系设计（Differential Oracle + 状态机 Fuzzing + 畸形流语料 + 白盒路径断言）
 
-    public M wrap(byte[] buffer, int offset, int length) {
-        this.reset();
-        this.buf = buffer;
-        this.rawOffset = offset;
-        this.rawLength = length;
-        return (M) this;
-    }
+由于 `lazy-proto` 涉及 **延迟解析、共享切片、浅拷贝分叉、原地补丁、连续区间拼接** 五种机制的交织，传统的“单步线性单元测试（`parse -> get/set -> toByteArray`）”无法覆盖多步状态跃迁中的组合爆炸。为此，我们设计一套 **六维验证体系（6-Pillar Verification Architecture）**：
 
-    public void reset() {
-        this.buf = null;
-        this.rawOffset = 0;
-        this.rawLength = 0;
-        this.tapeCount = 0;
-        this.scanned = false;
-        this.presentMask = 0L;
-        this.decodedMask = 0L;
-        this.sameSizeDirtyMask = 0L;
-        this.varSizeDirtyMask = 0L;
-        this.cachedSerializedSize = -1;
-    }
+```mermaid
+flowchart TD
+    subgraph P1["维度 1: 差分对拍验证 (Differential Oracle)"]
+        O1["官方 StandardOrderProto + DynamicMessage 作为真值 Oracle"]
+        O2["双重不变量断言: 全量 Getter 一致性 + 序列化字节官方解码等价性"]
+    end
 
-    @Override
-    public int getSerializedSize() {
-        if (!scanned || varSizeDirtyMask == 0L) {
-            return this.rawLength; // Fast-Path 0 & 1: O(1) 直接返回原长度！
-        }
-        if (cachedSerializedSize >= 0) {
-            return cachedSerializedSize;
-        }
-        return cachedSerializedSize = computeSplicedSize();
-    }
+    subgraph P2["维度 2: 有状态随机序列模型检测 (Stateful Model Fuzzing)"]
+        F1["维护活跃 Message 快照池 + Builder 分叉池"]
+        F2["12 类随机动作序列 (读/同长改/变长改/替换clean子对象/恢复原对象/查Size/Fork/Build后继续改/重Wrap)"]
+        F3["每步校验历史快照 0 污染 + 当前分支与 Oracle 100% 对齐"]
+    end
 
-    @Override
-    public byte[] toByteArray() {
-        // Fast-Path 0: 完全未修改，单次 arraycopy 直出
-        if ((sameSizeDirtyMask | varSizeDirtyMask) == 0L) {
-            byte[] out = new byte[rawLength];
-            System.arraycopy(buf, rawOffset, out, 0, rawLength);
-            return out;
-        }
-        // Fast-Path 1: 仅有等长修改，整块拷贝后在目标偏移处原地打补丁
-        if (varSizeDirtyMask == 0L) {
-            byte[] out = new byte[rawLength];
-            System.arraycopy(buf, rawOffset, out, 0, rawLength);
-            applyInPlacePatches(out, rawOffset);
-            return out;
-        }
-        // Fast-Path 2 & 3: 连续原始区间拼接 (Contiguous Span Splicing)
-        byte[] out = new byte[getSerializedSize()];
-        WireWriter writer = new WireWriter(out, 0);
-        writeSplicedTo(writer);
-        return out;
-    }
+    subgraph P3["维度 3: 畸形与非规范二进制流语料库 (Adversarial Wire Corpus)"]
+        W1["Overlong Varint (2~5字节编码小整数)"]
+        W2["交错分段子消息 (Split Sub-Message #5 夹杂其他字段与内部字段覆盖)"]
+        W3["重复单值标量覆盖 vs Unpacked Repeated 保留"]
+        W4["Wrong WireType 碰撞 / 字段号边界 (1, 15, 16, 63, 64, 65, 2048, 2^29-1)"]
+        W5["截断流 / 越界 Length / 非法嵌套子消息懒透传 vs 访问即报错"]
+    end
 
-    @Override
-    public ByteString toByteString() {
-        if ((sameSizeDirtyMask | varSizeDirtyMask) == 0L) {
-            // 零拷贝直接包装原输入数组切片！
-            return UnsafeByteOperations.unsafeWrap(buf, rawOffset, rawLength);
-        }
-        return UnsafeByteOperations.unsafeWrap(toByteArray());
-    }
+    subgraph P4["维度 4: 生命周期、所有权与缓冲区矩阵 (Ownership & Aliasing)"]
+        L1["同一外部只读子对象同时挂载到多个父 Builder (DAG 共享)"]
+        L2["持有子 Builder 跨父 build() 周期继续修改"]
+        L3["输出 byte[] 与输入缓冲区覆写隔离 / 实例 100 次跨结构重复 wrap()"]
+    end
 
-    // ==================== 显式裁剪的方法：直接抛出异常 ====================
+    subgraph P5["维度 5: 惰性与快速路径白盒断言 (White-Box Path Invariants)"]
+        I1["断言未访问子消息 isScanned() == false & 未访问列表项 loadedCount == 0"]
+        I2["断言 Fast-Path 0 / Fast-Path 1 / Fast-Path 2 命中状态与 Span 合并次数"]
+    end
 
-    @Override
-    public final boolean equals(Object obj) {
-        throw new UnsupportedOperationException(
-            "equals() is disabled in lazy-proto to prevent full-tree eager deserialization. " +
-            "Use rawBytesEquals() or compare business key fields directly.");
-    }
+    subgraph P6["维度 6: 双契约对齐性能与分配基准 (Dual-Contract Benchmarks)"]
+        B1["契约 A (Immutable Snapshot): parseFrom -> toBuilder -> build -> toByteArray"]
+        B2["契约 B (Zero-Alloc Pooled): wrap -> inPlaceMutate -> writeToBuffer"]
+    end
 
-    @Override
-    public final int hashCode() {
-        throw new UnsupportedOperationException(
-            "hashCode() is disabled in lazy-proto. Do not use mutable LazyMessage as Map keys.");
-    }
-
-    @Override
-    public final Descriptors.Descriptor getDescriptorForType() {
-        throw new UnsupportedOperationException("Reflection Descriptor is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Map<Descriptors.FieldDescriptor, Object> getAllFields() {
-        throw new UnsupportedOperationException("getAllFields() reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final boolean hasField(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Object getField(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final UnknownFieldSet getUnknownFields() {
-        throw new UnsupportedOperationException(
-            "UnknownFieldSet object creation is disabled; unknown fields are preserved in FieldTape automatically.");
-    }
-
-    @Override
-    public final Message.Builder setField(Descriptors.FieldDescriptor field, Object value) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder clearField(Descriptors.FieldDescriptor field) {
-        throw new UnsupportedOperationException("Reflection is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder setUnknownFields(UnknownFieldSet unknownFields) {
-        throw new UnsupportedOperationException("UnknownFieldSet is disabled in lazy-proto.");
-    }
-
-    @Override
-    public final Message.Builder mergeUnknownFields(UnknownFieldSet unknownFields) {
-        throw new UnsupportedOperationException("UnknownFieldSet is disabled in lazy-proto.");
-    }
-
-    @Override
-    public String toString() {
-        // 防呆设计：绝不触发未读字段反序列化
-        return getClass().getSimpleName() + "[rawLen=" + rawLength +
-               ", scanned=" + scanned +
-               ", decoded=0x" + Long.toHexString(decodedMask) +
-               ", dirty=0x" + Long.toHexString(sameSizeDirtyMask | varSizeDirtyMask) + "]";
-    }
-
-    protected abstract int computeSplicedSize();
-    protected abstract void applyInPlacePatches(byte[] target, int baseOffset);
-    protected abstract void writeSplicedTo(WireWriter writer);
-}
+    P1 --> P2 --> P3 --> P4 --> P5 --> P6
 ```
 
-#### 2. 生成类 `Order` 示例（兼容 `OrderOrBuilder`、`Order.parseFrom`、`order.toBuilder()`）
+### 11.1 维度一：差分对拍验证器（Differential Oracle Harness）
+构建通用的 `DifferentialVerifier.assertEquivalent(OrderEnvelope expectedOracle, LazyOrderEnvelope actualLazy)`，在每次操作后执行三层核验：
+1. **未读态直接序列化核验**：在**不调用 `actualLazy` 任何 Getter** 的前提下先调用 `actualLazy.toByteArray()`（专门捕捉“必须先调 `getUser()` 才能正确序列化，不调就 NPE”的隐蔽 Bug！）。
+2. **尺寸与多出口一致性核验**：断言 `getSerializedSize() == toByteArray().length == toByteString().size()`，且 `writeTo(CodedOutputStream)`、`writeTo(ByteArrayOutputStream)`、`writeToBuffer(buf, offset)` 产出的字节流 100% 逐字节相同。
+3. **官方解码与全字段对拍**：将 `actualLazy.toByteArray()` 喂给官方 `OrderEnvelope.parseFrom()`，断言 `expectedOracle.equals(decoded)`（包含所有已知字段、100 个列表项及 `UnknownFieldSet`），最后再遍历 `actualLazy` 的所有 Getter 与 `expectedOracle` 逐一比对。
 
-```java
-public final class Order extends AbstractLazyMessage<Order> implements OrderOrBuilder {
-    // 字段位图常量 (Bit Positions)
-    private static final int SLOT_ORDER_ID = 0; // field #1
-    private static final int SLOT_BUYER    = 1; // field #2
-    private static final int SLOT_STATUS   = 2; // field #3
-    private static final long BIT_ORDER_ID = 1L << SLOT_ORDER_ID;
-    private static final long BIT_BUYER    = 1L << SLOT_BUYER;
-    private static final long BIT_STATUS   = 1L << SLOT_STATUS;
+### 11.2 维度二：基于状态机的随机操作序列 Fuzzing（Stateful Builder Model Checking）
+专门针对状态跃迁组合爆炸设计随机状态机测试（如运行 500 条随机种子轨迹，每条轨迹 30~50 步随机操作）：
+- **状态池**：同时维护 `List<SnapshotPair> builtSnapshots`（记录历史上所有 `build()` 出来的 `LazyOrderEnvelope` 及其冻结时的字节快照）与 `List<BuilderPair> activeBuilders`。
+- **动作集（Action Alphabet）**：
+  1. 随机读取若干顶层或嵌套字段（在修改前、修改后、`toBuilder` 前后随机触发 `decodedMask`）；
+  2. 随机执行**同长修改**（如 `status: 1 -> 2`、`city: "SH" -> "BJ"`、`fixed64`、`double`）；
+  3. 随机执行**变长修改**（增长字符串、缩短字符串、跨 Varint 字节边界 `127 <-> 128`）；
+  4. 随机调用 **`getUserBuilder().setXxx()`** 原地修改子消息，或 **`getItemsBuilder(i).setXxx()`** 修改随机列表项；
+  5. 随机调用 **`setUser(externalCleanUser)`**（传入由另一段字节流 `parseFrom` 得到的 clean 子对象）或 **`setUser(externalDirtyUser)`**；
+  6. 随机调用 **`setUser(savedOriginalUser)`** 恢复初始子对象；
+  7. 随机在两次修改之间插入 **`getSerializedSize()`**（强制提前生成 `cachedSerializedSize`，检验后续修改或恢复操作是否正确使缓存失效！）；
+  8. 随机调用 **`toBuilder()` / ` builder.clone()`** 派生新分支加入 `activeBuilders`；
+  9. 随机调用 **`builder.build()`** 将产物存入 `builtSnapshots`，并**故意继续修改刚才的 `builder` 和之前持有的 `userBuilder`**；
+  10. **全局不变量检查**：每走一步，遍历 `builtSnapshots` 中所有历史已构建对象，断言它们的 Getter 与 `toByteArray()` 与当初 `build()` 时刻的快照 **100% 逐字节一致（零回溯污染）**！
 
-    // 密集槽位 -> FieldTape 下标映射表 (O(1) 定位)
-    private final int[] slotTapeIdx = new int[] { -1, -1, -1 };
+### 11.3 维度三：畸形与非规范二进制流专项语料库（Adversarial Wire Corpus）
+构造官方 `Builder.build().toByteArray()` 不会生成、但真实网络或跨语言客户端完全可能发出的 7 类合法/非法二进制包：
+1. **Overlong Varint 语料**：用 3 字节 `0x81 0x80 0x00` 编码 `status = 1`，随后调用 `setStatus(2)`（规范编码 1 字节）——验证 `lazy-proto` 比较的是 `tapeValueLength(idx) (3)` 而非 `varintSize(1) (1)`，绝不错误落入 Fast-Path 1。
+2. **多段交错子消息语料（Interleaved Split Sub-Message）**：`#5(user: id=1, city="A") -> #3(status=1) -> #5(user: vip=9, city="B")`，测试只读合并、同长修改、变长修改、替换后再 fork。
+3. **重复标量 vs Unpacked Repeated 语料**：同一包内既有重复单值字段 `#2("old") -> #2("new")`，又有未知/动态 `unpacked repeated` 字段 `#15(10) -> #15(20) -> #15(30)`。
+4. **Wrong WireType 混合语料**：`#1(FIXED64, 999)`、`**#2(VARINT, 123)**`、`#5(VARINT, 456)`（子消息字段收到 VARINT！），以及“先收到错误 WireType 的 `#1(FIXED64)`、后收到正确 WireType 的 `#1(VARINT, 888)`”。
+5. **位图边界字段号语料**：在 `ProtoDocument` 中同时测试字段号 `1, 15, 16, 31, 32, 63, 64, 65, 128, 2048` 的读写、删除、插入与重复 `wrap()`。
+6. **空消息与默认值回写语料**：0 字节输入 `new byte[0]`、所有字段均为默认值的消息、将已有字段 `setStatus(0)` / `setBuyerName("")` 置回默认值后再序列化。
+7. **损坏流与嵌套坏字节语料**：顶层截断 Varint / 越界 Length 必抛异常；嵌套子消息 `#5` 内部含坏字节时，未访问 `#5` 走透传，一旦访问 `getUser().getCity()` 或调用 `validateDeep()` 立即抛异常。
 
-    // 按需解码后的缓存槽位
-    private long orderId_;
-    private String buyer_;
-    private int status_;
-
-    // 预绑定的零分配 Builder 视图
-    private final Builder builderView = new Builder(this);
-
-    public static Order parseFrom(byte[] data) {
-        return new Order().wrap(data, 0, data.length);
-    }
-
-    @Override
-    public long getOrderId() {
-        if ((decodedMask & BIT_ORDER_ID) == 0L) {
-            ensureScanned();
-            int idx = slotTapeIdx[SLOT_ORDER_ID];
-            this.orderId_ = (idx >= 0) ? WireReader.readInt64At(buf, tapeValueOffset(idx)) : 0L;
-            decodedMask |= BIT_ORDER_ID;
-        }
-        return this.orderId_;
-    }
-
-    public Order setStatus(int value) {
-        ensureScanned();
-        this.status_ = value;
-        this.decodedMask |= BIT_STATUS;
-        this.presentMask |= BIT_STATUS;
-
-        int idx = slotTapeIdx[SLOT_STATUS];
-        if (idx >= 0) {
-            int oldValLen = tapeValueLength(idx);
-            int newValLen = WireWriter.varint32Size(value);
-            if (oldValLen == newValLen && (tapeFlags(idx) != FLAG_DIRTY_VAR_SIZE)) {
-                // 新旧编码字节长度完全相等 -> 走 Fast-Path 1 原地修补！
-                setTapeFlags(idx, FLAG_DIRTY_SAME_SIZE);
-                this.sameSizeDirtyMask |= BIT_STATUS;
-                bubbleSameSizeDirtyToParent();
-                return this;
-            }
-            setTapeFlags(idx, FLAG_DIRTY_VAR_SIZE);
-        }
-        this.varSizeDirtyMask |= BIT_STATUS;
-        this.cachedSerializedSize = -1;
-        bubbleVarSizeDirtyToParent();
-        return this;
-    }
-
-    @Override
-    public Builder toBuilder() {
-        return this.builderView; // 0 对象分配！
-    }
-
-    // 兼容官方 Order.Builder 静态内部类签名
-    public static final class Builder implements OrderOrBuilder {
-        private final Order host;
-        private Builder(Order host) { this.host = host; }
-
-        @Override public long getOrderId() { return host.getOrderId(); }
-        public Builder setStatus(int value) { host.setStatus(value); return this; }
-        public Order build() { return host; }
-        public Order buildPartial() { return host; }
-    }
-}
-```
+### 11.4 维度四 & 五：白盒惰性路径断言与双契约性能基准
+- **白盒计数器断言**：在测试中直接检查 `msg.isScanned()`、`msg.getUser().isScanned()`、`msg.isClean()`、`msg.isSameSizeDirtyOnly()`，确保不会出现“表面输出正确，实则退化为全量重编码”的隐性性能回退。
+- **双契约性能对齐**：在 Benchmark 中明确分列 **契约 A（`toBuilder()` 默认快照隔离模式）** 与 **契约 B（`toInPlaceBuilder()` 显式原地零分配复用模式）** 的耗时 (`ns/op`) 与堆分配 (`Bytes/op`)。
 
 ---
 
-## 10. 关键边界与 Protobuf Wire 语义完备性
-
-1. **同一非 `repeated` 标量字段在流中多次出现（Last-Write-Wins & Shadowing）**：
-   - `ShallowScanner` 在扫描时，若发现 `fieldTapeIdx[fieldNum]` 已存在旧条目 `oldIdx`（且该字段为非 `repeated` 标量/字符串）：
-   - 立即将 `tape[oldIdx].flags` 置为 `SHADOWED`，并将 `fieldTapeIdx[fieldNum]` 更新为当前新条目 `newIdx`。
-   - 若用户随后调用 `setXxx()` 修改了该字段，`newIdx` 变为 `DIRTY`，而 `oldIdx` 因为是 `SHADOWED`，在序列化拼接时会被自动跳过剔除，保证修改后的输出中绝不会残留被覆盖的旧值。
-2. **同一嵌套子消息在流中分多段出现（Split Sub-Message Merge Semantics）**：
-   - 根据 Protobuf 规范，如果同一个非 `repeated` 子消息字段在流中出现多次，语义是 **Merge（合并）** 而非覆盖。
-   - `ShallowScanner` 通过 `TapeEntry.nextTapeIdx` 将同一子消息的多个片段串联起来：
-     - 若该子消息从未被读取也未被修改，Span Splicing 原样保留所有片段，下游解析结果完全等价；
-     - 若该子消息被读取或修改，子消息的 `ShallowScanner` 会依次扫描链表中的所有片段并合并到同一张子 `FieldTape` 中；若发生修改，则将原多段中的前序片段标记为 `SHADOWED`，在最后一个片段位置输出合并后的完整子消息。
-3. **缓冲区安全屏障（16-Byte Slop & Bounds Protection）**：
-   - SWAR 64-bit 读取每次预读 8 字节。当 `cursor > end - 8`（即距离缓冲区末尾不足 8 字节）时，自动切回安全的逐字节尾部读取分支（或要求输入 Buffer 留有 8~16 字节尾部 Padding），确保绝不发生越界内存访问（SIGSEGV / `IndexOutOfBoundsException`），同时对残损截断的非法 Protobuf 包抛出明确的 `MalformedWireException`。
-
----
-
-## 11. 模块划分与分阶段实施路线图
+## 12. 模块划分与实测基准报告
 
 ```text
 lazy-proto/

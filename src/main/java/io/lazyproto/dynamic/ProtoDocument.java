@@ -318,8 +318,9 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument> {
 
     private void shadowEarlierOccurrences(int fieldNumber, int activeIdx) {
         for (int i = 0; i < activeIdx; i++) {
-            if (tapeFieldNumber(i) == fieldNumber && tapeFlags(i) != FLAG_DELETED) {
+            if (tapeFieldNumber(i) == fieldNumber && tapeFlags(i) != FLAG_DELETED && tapeFlags(i) != FLAG_SHADOWED) {
                 setTapeFlags(i, FLAG_SHADOWED);
+                hasDeletedEntries = true;
             }
         }
     }

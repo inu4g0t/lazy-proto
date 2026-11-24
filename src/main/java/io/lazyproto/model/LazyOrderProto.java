@@ -419,28 +419,33 @@ public final class LazyOrderProto {
                 this.parentBuilder = parentBuilder;
             }
 
+            private LazyUserProfile currentImpl() {
+                if (parentBuilder != null) {
+                    this.impl = parentBuilder.impl().getUserBuilder();
+                }
+                return this.impl;
+            }
+
             private void ensureBuilderMutable() {
                 if (parentBuilder != null) {
-                    if (parentBuilder.isBuilt()) {
-                        parentBuilder.ensureMutable();
-                        this.impl = parentBuilder.impl().getUserBuilder();
-                    }
+                    parentBuilder.ensureMutable();
+                    this.impl = parentBuilder.impl().getUserBuilder();
                 } else {
                     ensureMutable();
                 }
             }
 
-            @Override public long getUserId() { return impl.getUserId(); }
+            @Override public long getUserId() { return currentImpl().getUserId(); }
             public Builder setUserId(long v) { ensureBuilderMutable(); impl.setUserId(v); return this; }
-            @Override public String getCity() { return impl.getCity(); }
-            @Override public ByteString getCityBytes() { return impl.getCityBytes(); }
+            @Override public String getCity() { return currentImpl().getCity(); }
+            @Override public ByteString getCityBytes() { return currentImpl().getCityBytes(); }
             public Builder setCity(String v) { ensureBuilderMutable(); impl.setCity(v); return this; }
-            @Override public int getVipLevel() { return impl.getVipLevel(); }
+            @Override public int getVipLevel() { return currentImpl().getVipLevel(); }
             public Builder setVipLevel(int v) { ensureBuilderMutable(); impl.setVipLevel(v); return this; }
-            @Override public double getScore() { return impl.getScore(); }
+            @Override public double getScore() { return currentImpl().getScore(); }
             public Builder setScore(double v) { ensureBuilderMutable(); impl.setScore(v); return this; }
-            @Override public String getEmail() { return impl.getEmail(); }
-            @Override public ByteString getEmailBytes() { return impl.getEmailBytes(); }
+            @Override public String getEmail() { return currentImpl().getEmail(); }
+            @Override public ByteString getEmailBytes() { return currentImpl().getEmailBytes(); }
             public Builder setEmail(String v) { ensureBuilderMutable(); impl.setEmail(v); return this; }
 
             @Override
@@ -818,22 +823,49 @@ public final class LazyOrderProto {
         public static final class Builder extends AbstractLazyBuilder<LazyLineItem, Builder>
                 implements LineItemOrBuilder {
 
+            private final LazyOrderEnvelope.Builder parentBuilder;
+            private final int itemIndex;
+
             private Builder(LazyLineItem initialImpl) {
                 super(initialImpl);
+                this.parentBuilder = null;
+                this.itemIndex = -1;
             }
 
-            @Override public long getItemId() { return impl.getItemId(); }
-            public Builder setItemId(long v) { ensureMutable(); impl.setItemId(v); return this; }
-            @Override public String getSku() { return impl.getSku(); }
-            @Override public ByteString getSkuBytes() { return impl.getSkuBytes(); }
-            public Builder setSku(String v) { ensureMutable(); impl.setSku(v); return this; }
-            @Override public int getQuantity() { return impl.getQuantity(); }
-            public Builder setQuantity(int v) { ensureMutable(); impl.setQuantity(v); return this; }
-            @Override public long getPriceCents() { return impl.getPriceCents(); }
-            public Builder setPriceCents(long v) { ensureMutable(); impl.setPriceCents(v); return this; }
-            @Override public String getDescription() { return impl.getDescription(); }
-            @Override public ByteString getDescriptionBytes() { return impl.getDescriptionBytes(); }
-            public Builder setDescription(String v) { ensureMutable(); impl.setDescription(v); return this; }
+            Builder(LazyLineItem initialImpl, LazyOrderEnvelope.Builder parentBuilder, int itemIndex) {
+                super(initialImpl);
+                this.parentBuilder = parentBuilder;
+                this.itemIndex = itemIndex;
+            }
+
+            private LazyLineItem currentImpl() {
+                if (parentBuilder != null) {
+                    this.impl = parentBuilder.impl().getItems(itemIndex);
+                }
+                return this.impl;
+            }
+
+            private void ensureBuilderMutable() {
+                if (parentBuilder != null) {
+                    parentBuilder.ensureMutable();
+                    this.impl = parentBuilder.impl().getItems(itemIndex);
+                } else {
+                    ensureMutable();
+                }
+            }
+
+            @Override public long getItemId() { return currentImpl().getItemId(); }
+            public Builder setItemId(long v) { ensureBuilderMutable(); impl.setItemId(v); return this; }
+            @Override public String getSku() { return currentImpl().getSku(); }
+            @Override public ByteString getSkuBytes() { return currentImpl().getSkuBytes(); }
+            public Builder setSku(String v) { ensureBuilderMutable(); impl.setSku(v); return this; }
+            @Override public int getQuantity() { return currentImpl().getQuantity(); }
+            public Builder setQuantity(int v) { ensureBuilderMutable(); impl.setQuantity(v); return this; }
+            @Override public long getPriceCents() { return currentImpl().getPriceCents(); }
+            public Builder setPriceCents(long v) { ensureBuilderMutable(); impl.setPriceCents(v); return this; }
+            @Override public String getDescription() { return currentImpl().getDescription(); }
+            @Override public ByteString getDescriptionBytes() { return currentImpl().getDescriptionBytes(); }
+            public Builder setDescription(String v) { ensureBuilderMutable(); impl.setDescription(v); return this; }
 
             @Override
             public Builder clone() {
@@ -1204,7 +1236,41 @@ public final class LazyOrderProto {
             return this;
         }
 
+        public LazyOrderEnvelope clearUser() {
+            ensureScanned();
+            if (userView_ != null) {
+                userView_.reset();
+            }
+            this.decodedMask &= ~BIT_USER;
+            this.presentMask &= ~BIT_USER;
+            boolean hadAppended = (this.appendedMask & BIT_USER) != 0L;
+            this.appendedMask &= ~BIT_USER;
+            this.sameSizeDirtyMask &= ~BIT_USER;
+            int idx = slotTapeIdx[SLOT_USER];
+            if (idx >= 0) {
+                int curr = idx;
+                while (curr != NO_NEXT_IDX) {
+                    setTapeFlags(curr, FLAG_DELETED);
+                    curr = tapeNextIdx(curr);
+                }
+                slotTapeIdx[SLOT_USER] = -1;
+                userTailTapeIdx = -1;
+                this.hasDeletedEntries = true;
+                this.varSizeDirtyMask |= BIT_USER;
+                bubbleVarSizeDirtyToParent();
+            } else if (hadAppended) {
+                this.varSizeDirtyMask &= ~BIT_USER;
+                invalidateSizeCacheUpward();
+                bubbleVarSizeDirtyToParent();
+            }
+            return this;
+        }
+
         // -------------------- Field #6: repeated LineItem items --------------------
+
+        public int loadedItemsCount() {
+            return itemsList_.loadedScannedElementCount();
+        }
 
         public List<LazyLineItem> getItemsList() {
             ensureScanned();
@@ -1231,13 +1297,34 @@ public final class LazyOrderProto {
             return itemsList_.get(index);
         }
 
+        public LazyOrderEnvelope setItems(int index, LazyLineItem item) {
+            ensureScanned();
+            itemsList_.setElement(index, item.copy());
+            return this;
+        }
+
         public LazyOrderEnvelope addItems(LazyLineItem item) {
             ensureScanned();
-            itemsList_.addElement(item);
+            itemsList_.addElement(item.copy());
             presentMask |= BIT_ITEMS;
             appendedMask |= BIT_ITEMS;
             varSizeDirtyMask |= BIT_ITEMS;
             bubbleVarSizeDirtyToParent();
+            return this;
+        }
+
+        public LazyOrderEnvelope clearItems() {
+            ensureScanned();
+            boolean hadItems = (presentMask & BIT_ITEMS) != 0L || (appendedMask & BIT_ITEMS) != 0L;
+            itemsList_.clearAll();
+            presentMask &= ~BIT_ITEMS;
+            appendedMask &= ~BIT_ITEMS;
+            sameSizeDirtyMask &= ~BIT_ITEMS;
+            if (hadItems) {
+                hasDeletedEntries = true;
+                varSizeDirtyMask |= BIT_ITEMS;
+                bubbleVarSizeDirtyToParent();
+            }
             return this;
         }
 
@@ -1694,12 +1781,19 @@ public final class LazyOrderProto {
 
             public Builder setUser(LazyUserProfile v) {
                 ensureMutable();
-                impl.setUser(v);
+                // Copy external user so DAG sharing across multiple builders is 100% isolated
+                impl.setUser(v.copy());
                 return this;
             }
 
             public Builder setUser(LazyUserProfile.Builder b) {
                 return setUser(b.build());
+            }
+
+            public Builder clearUser() {
+                ensureMutable();
+                impl.clearUser();
+                return this;
             }
 
             public List<LazyLineItem> getItemsList() { return impl.getItemsList(); }
@@ -1708,9 +1802,19 @@ public final class LazyOrderProto {
             public LazyLineItem getItems(int index) { return impl.getItems(index); }
             @Override public LineItemOrBuilder getItemsOrBuilder(int index) { return impl.getItemsOrBuilder(index); }
 
-            public LazyLineItem getItemsBuilder(int index) {
+            public LazyLineItem.Builder getItemsBuilder(int index) {
                 ensureMutable();
-                return impl.getItems(index);
+                return new LazyLineItem.Builder(impl.getItems(index), this, index);
+            }
+
+            public Builder setItems(int index, LazyLineItem item) {
+                ensureMutable();
+                impl.setItems(index, item);
+                return this;
+            }
+
+            public Builder setItems(int index, LazyLineItem.Builder itemBuilder) {
+                return setItems(index, itemBuilder.build());
             }
 
             public Builder addItems(LazyLineItem item) {
@@ -1721,6 +1825,12 @@ public final class LazyOrderProto {
 
             public Builder addItems(LazyLineItem.Builder itemBuilder) {
                 return addItems(itemBuilder.build());
+            }
+
+            public Builder clearItems() {
+                ensureMutable();
+                impl.clearItems();
+                return this;
             }
 
             @Override public ByteString getPayload() { return impl.getPayload(); }
