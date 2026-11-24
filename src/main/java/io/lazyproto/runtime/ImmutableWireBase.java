@@ -80,6 +80,40 @@ public abstract class ImmutableWireBase {
         return hasShadowedEntries;
     }
 
+    public final boolean hasUnknownFields() {
+        ensureScanned();
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public final byte[] extractUnknownFieldsBytes() {
+        ensureScanned();
+        int totalBytes = 0;
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                totalBytes += tapeRecordLength(i);
+            }
+        }
+        if (totalBytes == 0) {
+            return EMPTY_BYTES;
+        }
+        byte[] out = new byte[totalBytes];
+        int pos = 0;
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                int off = tapeTagOffset(i);
+                int len = tapeRecordLength(i);
+                System.arraycopy(buf, off, out, pos, len);
+                pos += len;
+            }
+        }
+        return out;
+    }
+
     public final byte[] rawBuffer() {
         return buf;
     }

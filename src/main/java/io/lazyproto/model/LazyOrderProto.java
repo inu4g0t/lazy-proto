@@ -2,6 +2,7 @@ package io.lazyproto.model;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
+import com.google.protobuf.MessageLite;
 import com.google.protobuf.UnsafeByteOperations;
 import io.lazyproto.model.OrderInterfaces.LineItemOrBuilder;
 import io.lazyproto.model.OrderInterfaces.OrderEnvelopeOrBuilder;
@@ -17,6 +18,8 @@ import io.lazyproto.wire.WireFormat;
 import io.lazyproto.wire.WireReader;
 import io.lazyproto.wire.WireWriter;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
@@ -518,6 +521,23 @@ public final class LazyOrderProto {
             }
 
             @Override
+            protected Builder mergeFromTypedMessage(MessageLite other) {
+                if (other == emptyDefaultMessage()) {
+                    return self();
+                }
+                if (other instanceof UserProfileOrBuilder src) {
+                    if (src.getUserId() != 0L) setUserId(src.getUserId());
+                    if (!src.getCityBytes().isEmpty()) setCity(src.getCity());
+                    if (src.getVipLevel() != 0) setVipLevel(src.getVipLevel());
+                    if (Double.doubleToRawLongBits(src.getScore()) != 0L) setScore(src.getScore());
+                    if (!src.getEmailBytes().isEmpty()) setEmail(src.getEmail());
+                    mergeUnknownFieldsFromMessage(other);
+                    return self();
+                }
+                return super.mergeFromTypedMessage(other);
+            }
+
+            @Override
             public Builder clone() {
                 UserBase b = resolveReadBase();
                 UserOverlay o = resolveReadOverlay();
@@ -1009,6 +1029,23 @@ public final class LazyOrderProto {
             }
 
             @Override
+            protected Builder mergeFromTypedMessage(MessageLite other) {
+                if (other == emptyDefaultMessage()) {
+                    return self();
+                }
+                if (other instanceof LineItemOrBuilder src) {
+                    if (src.getItemId() != 0L) setItemId(src.getItemId());
+                    if (!src.getSkuBytes().isEmpty()) setSku(src.getSku());
+                    if (src.getQuantity() != 0) setQuantity(src.getQuantity());
+                    if (src.getPriceCents() != 0L) setPriceCents(src.getPriceCents());
+                    if (!src.getDescriptionBytes().isEmpty()) setDescription(src.getDescription());
+                    mergeUnknownFieldsFromMessage(other);
+                    return self();
+                }
+                return super.mergeFromTypedMessage(other);
+            }
+
+            @Override
             public Builder clone() {
                 LineItemBase b = resolveReadBase();
                 LineItemOverlay o = resolveReadOverlay();
@@ -1037,18 +1074,17 @@ public final class LazyOrderProto {
         private static final int SLOT_TOTAL      = 9;
 
         private static final int[] EMPTY_INTS = new int[0];
+        private static final VarHandle ITEM_ARRAY_VH = MethodHandles.arrayElementVarHandle(LineItemBase[].class);
 
         final int[] slotTapeIdx = new int[] { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 
         int[] userSegTapeIdx;
         int userSegCount;
-        UserBase cachedUserBase;
-        boolean userBaseBound;
+        volatile UserBase cachedUserBase;
 
         int[] itemsTapeIdx = EMPTY_INTS;
         int itemsCount;
         LineItemBase[] cachedItemBases;
-        boolean[] itemBaseBound;
 
         String buyerNameCache;
         String authTokenCache;
@@ -1066,13 +1102,15 @@ public final class LazyOrderProto {
 
         @Override
         protected void onFreeze() {
-            if (cachedUserBase != null) {
-                cachedUserBase.freeze();
+            UserBase ub = this.cachedUserBase;
+            if (ub != null) {
+                ub.freeze();
             }
             if (cachedItemBases != null) {
                 for (int i = 0; i < itemsCount && i < cachedItemBases.length; i++) {
-                    if (cachedItemBases[i] != null) {
-                        cachedItemBases[i].freeze();
+                    LineItemBase ib = (LineItemBase) ITEM_ARRAY_VH.getAcquire(cachedItemBases, i);
+                    if (ib != null) {
+                        ib.freeze();
                     }
                 }
             }
@@ -1082,31 +1120,35 @@ public final class LazyOrderProto {
         protected void resetBaseSlots() {
             Arrays.fill(slotTapeIdx, -1);
             userSegCount = 0;
-            userBaseBound = false;
-            if (cachedUserBase != null) {
-                if (cachedUserBase.isFrozen()) {
-                    cachedUserBase = null;
-                } else {
-                    cachedUserBase.resetForReuse(EMPTY_BYTES, 0, 0);
-                }
-            }
-            for (int i = 0; i < itemsCount && cachedItemBases != null && i < cachedItemBases.length; i++) {
-                LineItemBase ib = cachedItemBases[i];
-                if (itemBaseBound != null && i < itemBaseBound.length) {
-                    itemBaseBound[i] = false;
-                }
-                if (ib != null) {
-                    if (ib.isFrozen()) {
-                        cachedItemBases[i] = null;
-                    } else {
-                        ib.resetForReuse(EMPTY_BYTES, 0, 0);
-                    }
+            cachedUserBase = null;
+            if (cachedItemBases != null) {
+                int limit = Math.min(itemsCount, cachedItemBases.length);
+                for (int i = 0; i < limit; i++) {
+                    cachedItemBases[i] = null;
                 }
             }
             itemsCount = 0;
             buyerNameCache = null;
             authTokenCache = null;
             traceIdCache = null;
+        }
+
+        void drainUnfrozenChildrenToPool(LazyOrderEnvelope.Builder pool) {
+            UserBase ub = this.cachedUserBase;
+            if (ub != null) {
+                this.cachedUserBase = null;
+                pool.recycleUserBase(ub);
+            }
+            if (cachedItemBases != null) {
+                int limit = Math.min(itemsCount, cachedItemBases.length);
+                for (int i = 0; i < limit; i++) {
+                    LineItemBase ib = cachedItemBases[i];
+                    if (ib != null) {
+                        cachedItemBases[i] = null;
+                        pool.recycleItemBase(ib);
+                    }
+                }
+            }
         }
 
         @Override
@@ -1192,56 +1234,95 @@ public final class LazyOrderProto {
         }
 
         public UserBase getOrCreateUserBase() {
+            return getOrCreateUserBase(null);
+        }
+
+        UserBase getOrCreateUserBase(LazyOrderEnvelope.Builder poolOwner) {
             ensureScanned();
             if (userSegCount == 0) {
                 return UserBase.EMPTY;
             }
-            if (cachedUserBase == null) {
-                cachedUserBase = new UserBase();
-                userBaseBound = false;
+            UserBase ub = this.cachedUserBase;
+            if (ub != null) {
+                return ub;
             }
-            if (!userBaseBound) {
-                if (userSegCount == 1) {
-                    int idx = userSegTapeIdx[0];
-                    cachedUserBase.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
-                } else {
-                    cachedUserBase.wrapMultiSegments(buf, tape, userSegTapeIdx, userSegCount);
+            if (this.frozen) {
+                synchronized (this) {
+                    ub = this.cachedUserBase;
+                    if (ub == null) {
+                        ub = bindNewUserBase(null, true);
+                        this.cachedUserBase = ub;
+                    }
+                    return ub;
                 }
-                if (this.frozen) {
-                    cachedUserBase.freeze();
-                }
-                userBaseBound = true;
             }
-            return cachedUserBase;
+            ub = bindNewUserBase(poolOwner, false);
+            this.cachedUserBase = ub;
+            return ub;
+        }
+
+        private UserBase bindNewUserBase(LazyOrderEnvelope.Builder poolOwner, boolean freezeNow) {
+            UserBase ub = poolOwner != null ? poolOwner.borrowPooledUserBase() : null;
+            if (ub == null) {
+                ub = new UserBase();
+            }
+            if (userSegCount == 1) {
+                int idx = userSegTapeIdx[0];
+                ub.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
+                if (freezeNow) {
+                    ub.freeze();
+                }
+            } else {
+                ub.wrapMultiSegments(buf, tape, userSegTapeIdx, userSegCount);
+            }
+            return ub;
         }
 
         public LineItemBase getOrCreateItemBase(int index) {
+            return getOrCreateItemBase(index, null);
+        }
+
+        LineItemBase getOrCreateItemBase(int index, LazyOrderEnvelope.Builder poolOwner) {
             ensureScanned();
             if (index < 0 || index >= itemsCount) {
                 throw new IndexOutOfBoundsException("Index " + index + " out of bounds for length " + itemsCount);
             }
+            LineItemBase[] arr = this.cachedItemBases;
+            if (arr != null && index < arr.length) {
+                LineItemBase ib = (LineItemBase) ITEM_ARRAY_VH.getAcquire(arr, index);
+                if (ib != null) {
+                    return ib;
+                }
+            }
+            if (this.frozen) {
+                synchronized (this) {
+                    return getOrCreateItemBaseLocked(index, null, true);
+                }
+            }
+            return getOrCreateItemBaseLocked(index, poolOwner, false);
+        }
+
+        private LineItemBase getOrCreateItemBaseLocked(int index, LazyOrderEnvelope.Builder poolOwner, boolean freezeNow) {
             if (cachedItemBases == null || index >= cachedItemBases.length) {
                 int newLen = Math.max(itemsCount, cachedItemBases == null ? 8 : cachedItemBases.length << 1);
-                cachedItemBases = cachedItemBases == null
-                        ? new LineItemBase[newLen]
-                        : Arrays.copyOf(cachedItemBases, newLen);
-                itemBaseBound = itemBaseBound == null
-                        ? new boolean[newLen]
-                        : Arrays.copyOf(itemBaseBound, newLen);
+                LineItemBase[] next = new LineItemBase[newLen];
+                if (cachedItemBases != null) {
+                    System.arraycopy(cachedItemBases, 0, next, 0, cachedItemBases.length);
+                }
+                cachedItemBases = next;
             }
-            LineItemBase ib = cachedItemBases[index];
+            LineItemBase ib = (LineItemBase) ITEM_ARRAY_VH.getAcquire(cachedItemBases, index);
             if (ib == null) {
-                ib = new LineItemBase();
-                cachedItemBases[index] = ib;
-                itemBaseBound[index] = false;
-            }
-            if (!itemBaseBound[index]) {
+                ib = poolOwner != null ? poolOwner.borrowPooledItemBase() : null;
+                if (ib == null) {
+                    ib = new LineItemBase();
+                }
                 int idx = itemsTapeIdx[index];
                 ib.resetForReuse(buf, tapeValueOffset(idx), tapeValueLength(idx));
-                if (this.frozen) {
+                if (freezeNow) {
                     ib.freeze();
                 }
-                itemBaseBound[index] = true;
+                ITEM_ARRAY_VH.setRelease(cachedItemBases, index, ib);
             }
             return ib;
         }
@@ -2126,6 +2207,11 @@ public final class LazyOrderProto {
             private final Utf8Slice authTokenSlice_ = new Utf8Slice();
             private final Utf8Slice traceIdSlice_ = new Utf8Slice();
 
+            // Builder-owned child Base reuse pool (never exposed on immutable/frozen OrderBase snapshots)
+            private UserBase pooledUserBase;
+            private LineItemBase[] pooledItemBases;
+            private int pooledItemCount;
+
             private Builder(OrderBase initialBase, OrderOverlay initialOverlay) {
                 super(initialBase, initialOverlay);
             }
@@ -2140,6 +2226,50 @@ public final class LazyOrderProto {
             @Override protected LazyOrderEnvelope emptyDefaultMessage() { return EMPTY; }
             @Override protected void resetOverlayInPlace(OrderOverlay ov) { ov.reset(); }
 
+            @Override
+            protected void onBeforeReuse() {
+                if (this.base != null && !this.base.isFrozen()) {
+                    this.base.drainUnfrozenChildrenToPool(this);
+                }
+            }
+
+            UserBase borrowPooledUserBase() {
+                UserBase ub = this.pooledUserBase;
+                this.pooledUserBase = null;
+                return ub;
+            }
+
+            void recycleUserBase(UserBase ub) {
+                if (ub != null && !ub.isFrozen() && this.pooledUserBase == null) {
+                    ub.resetForReuse(ImmutableWireBase.EMPTY_BYTES, 0, 0);
+                    this.pooledUserBase = ub;
+                }
+            }
+
+            LineItemBase borrowPooledItemBase() {
+                if (pooledItemCount > 0) {
+                    LineItemBase ib = pooledItemBases[--pooledItemCount];
+                    pooledItemBases[pooledItemCount] = null;
+                    return ib;
+                }
+                return null;
+            }
+
+            void recycleItemBase(LineItemBase ib) {
+                if (ib != null && !ib.isFrozen()) {
+                    ib.resetForReuse(ImmutableWireBase.EMPTY_BYTES, 0, 0);
+                    if (pooledItemBases == null) {
+                        pooledItemBases = new LineItemBase[8];
+                    } else if (pooledItemCount >= pooledItemBases.length) {
+                        if (pooledItemBases.length >= 256) {
+                            return;
+                        }
+                        pooledItemBases = Arrays.copyOf(pooledItemBases, pooledItemBases.length << 1);
+                    }
+                    pooledItemBases[pooledItemCount++] = ib;
+                }
+            }
+
             // -------------------- Sub-Builder Coordination Hooks --------------------
 
             UserBase resolveUserReadBase() {
@@ -2150,7 +2280,7 @@ public final class LazyOrderProto {
                         return overlay.userPatchBase;
                     }
                 }
-                return base.getOrCreateUserBase();
+                return base.getOrCreateUserBase(this);
             }
 
             UserOverlay resolveUserReadOverlay() {
@@ -2178,7 +2308,7 @@ public final class LazyOrderProto {
                         ov.userPatch.reset();
                     } else {
                         if (ov.userPatchBase == null) {
-                            ov.userPatchBase = base.getOrCreateUserBase();
+                            ov.userPatchBase = base.getOrCreateUserBase(this);
                         }
                         if (ov.userPatch == null) {
                             ov.userPatch = new UserOverlay();
@@ -2249,7 +2379,7 @@ public final class LazyOrderProto {
                         return s.replaced ? s.replacedMsg.baseRef() : s.base;
                     }
                 }
-                return base.getOrCreateItemBase(index);
+                return base.getOrCreateItemBase(index, this);
             }
 
             LineItemOverlay resolveItemReadOverlay(int index) {
@@ -2300,7 +2430,7 @@ public final class LazyOrderProto {
                 }
                 ItemSlot s = io.getBaseSlot(index);
                 if (s == null) {
-                    LineItemBase ib = base.getOrCreateItemBase(index);
+                    LineItemBase ib = base.getOrCreateItemBase(index, this);
                     LineItemOverlay patch = new LineItemOverlay();
                     s = ItemSlot.forPatch(ib, patch);
                     io.putBaseSlot(index, base, s);
@@ -2616,6 +2746,43 @@ public final class LazyOrderProto {
                 ov.totalCents = v;
                 ov.markScalarWritten(base, OrderBase.SLOT_TOTAL, OrderOverlay.BIT_TOTAL, WireWriter.varint64Size(v));
                 return this;
+            }
+
+            @Override
+            protected Builder mergeFromTypedMessage(MessageLite other) {
+                if (other == emptyDefaultMessage()) {
+                    return self();
+                }
+                if (other instanceof OrderEnvelopeOrBuilder src) {
+                    if (src.getOrderId() != 0L) setOrderId(src.getOrderId());
+                    if (!src.getBuyerNameBytes().isEmpty()) setBuyerName(src.getBuyerName());
+                    if (src.getStatus() != 0) setStatus(src.getStatus());
+                    if (src.getUpdatedAtFixed64() != 0L) setUpdatedAtFixed64(src.getUpdatedAtFixed64());
+                    if (src.hasUser()) {
+                        if (!hasUser()) {
+                            ensureMutableUserOverlay();
+                            syncUserOverlayState();
+                        }
+                        Object u = src.getUserOrBuilder();
+                        if (u instanceof MessageLite um) {
+                            cachedUserBuilder.mergeFrom(um);
+                        }
+                    }
+                    int itemCount = src.getItemsCount();
+                    for (int i = 0; i < itemCount; i++) {
+                        LineItemOrBuilder item = src.getItemsOrBuilder(i);
+                        if (item instanceof MessageLite im) {
+                            addItems(LazyLineItem.newBuilder().mergeFrom(im).build());
+                        }
+                    }
+                    if (!src.getPayload().isEmpty()) setPayload(src.getPayload());
+                    if (!src.getAuthTokenBytes().isEmpty()) setAuthToken(src.getAuthToken());
+                    if (!src.getTraceIdBytes().isEmpty()) setTraceId(src.getTraceId());
+                    if (src.getTotalCents() != 0L) setTotalCents(src.getTotalCents());
+                    mergeUnknownFieldsFromMessage(other);
+                    return self();
+                }
+                return super.mergeFromTypedMessage(other);
             }
 
             @Override

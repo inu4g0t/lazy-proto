@@ -102,6 +102,7 @@ public abstract class AbstractLazyBuilder<
         if (isBoundToParent()) {
             return replaceWithBytes(data, offset, length);
         }
+        onBeforeReuse();
         if (this.base == null || this.base.isFrozen()) {
             this.base = newEmptyBase();
         }
@@ -117,11 +118,16 @@ public abstract class AbstractLazyBuilder<
         return self();
     }
 
+    protected void onBeforeReuse() {}
+
     protected void resetOverlayInPlace(Ov ov) {}
 
     protected void onAfterReuse() {}
 
     protected B replaceWithBytes(byte[] data, int offset, int length) {
+        if (!isBoundToParent()) {
+            onBeforeReuse();
+        }
         if (this.base == null || this.base.isFrozen()) {
             this.base = newEmptyBase();
         }
@@ -133,6 +139,9 @@ public abstract class AbstractLazyBuilder<
     }
 
     protected B replaceWithByteString(ByteString data) {
+        if (!isBoundToParent()) {
+            onBeforeReuse();
+        }
         if (this.base == null || this.base.isFrozen()) {
             this.base = newEmptyBase();
         }
@@ -144,6 +153,9 @@ public abstract class AbstractLazyBuilder<
     }
 
     protected B clearAllFields() {
+        if (!isBoundToParent()) {
+            onBeforeReuse();
+        }
         if (this.base == null || this.base.isFrozen()) {
             this.base = newEmptyBase();
         } else {
@@ -317,16 +329,24 @@ public abstract class AbstractLazyBuilder<
 
     @Override
     public B mergeFrom(Message other) {
-        return mergeFromMessageLite(other);
+        return mergeFromTypedMessage(other);
     }
 
     @Override
     public B mergeFrom(MessageLite other) {
-        return mergeFromMessageLite(other);
+        return mergeFromTypedMessage(other);
     }
 
-    private B mergeFromMessageLite(MessageLite other) {
-        if (other == this.getDefaultInstanceForType()) {
+    /**
+     * Merges a {@link MessageLite} into this builder.
+     *
+     * <p>Schema-less builders (such as {@code ProtoDocument.Builder}) default to raw wire-level fusion
+     * so every explicit field entry is preserved. Strongly-typed proto3 generated builders override this
+     * method to enforce proto3 Message semantics (only non-default scalar fields, recursive sub-message
+     * merges, repeated appends, plus unknown fields).
+     */
+    protected B mergeFromTypedMessage(MessageLite other) {
+        if (other == this.getDefaultInstanceForType() || other == emptyDefaultMessage()) {
             return self();
         }
         if (other instanceof AbstractLazyMessage<?, ?, ?> lazyOther && lazyOther.isClean() && !lazyOther.isMultiSegment()) {
@@ -334,6 +354,26 @@ public abstract class AbstractLazyBuilder<
         }
         byte[] bytes = other.toByteArray();
         return mergeFrom(bytes, 0, bytes.length);
+    }
+
+    protected final void mergeUnknownFieldsFromMessage(MessageLite other) {
+        if (other instanceof AbstractLazyMessage<?, ?, ?> lazyOther) {
+            ImmutableWireBase otherBase = lazyOther.base();
+            if (otherBase.hasUnknownFields()) {
+                byte[] unk = otherBase.extractUnknownFieldsBytes();
+                if (unk.length > 0) {
+                    mergeFrom(unk, 0, unk.length);
+                }
+            }
+        } else if (other instanceof Message msg) {
+            UnknownFieldSet ufs = msg.getUnknownFields();
+            if (ufs != null && !ufs.asMap().isEmpty()) {
+                byte[] unk = ufs.toByteArray();
+                if (unk.length > 0) {
+                    mergeFrom(unk, 0, unk.length);
+                }
+            }
+        }
     }
 
     @Override

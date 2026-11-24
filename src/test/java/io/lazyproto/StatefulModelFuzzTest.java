@@ -26,6 +26,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -1392,5 +1397,158 @@ public class StatefulModelFuzzTest {
         assertFalse(dbDelParent.has(5));
         assertFalse(OrderEnvelope.parseFrom(dbDelParent.build().toByteArray()).hasUser());
         assertSame(LazyOrderEnvelope.EMPTY, pbMergeChild.getDefaultInstanceForType());
+    }
+
+    @Test
+    @DisplayName("Pillar 4E: GitHub Issue #4 Refactor Regression Matrix (Pool Isolation, Message vs Wire Merge, Concurrent Snapshot Reads)")
+    void testPillar4E_Issue4ArchitectureRefactorMatrix() throws Exception {
+        byte[] raw1 = createSeedOrderBytes(new Random(405), 3);
+        byte[] raw2 = OrderEnvelope.newBuilder()
+                .setOrderId(9901L)
+                .setBuyerName("Reuse2Buyer")
+                .setStatus(5)
+                .setUser(UserProfile.newBuilder().setUserId(222L).setCity("Hangzhou").setVipLevel(9).build())
+                .addItems(LineItem.newBuilder().setItemId(333L).setSku("SKU-R2-A").setQuantity(3).build())
+                .addItems(LineItem.newBuilder().setItemId(444L).setSku("SKU-R2-B").setQuantity(4).build())
+                .build().toByteArray();
+        byte[] raw3 = OrderEnvelope.newBuilder()
+                .setOrderId(7701L)
+                .setUser(UserProfile.newBuilder().setUserId(555L).setCity("Chengdu").setVipLevel(12).build())
+                .addItems(LineItem.newBuilder().setItemId(666L).setSku("SKU-R3").setQuantity(8).build())
+                .build().toByteArray();
+
+        // 1. Issue #4 P1 exact repro: reuse(raw1) -> read child -> reuse(raw2) -> build() -> read child
+        LazyOrderEnvelope.Builder bUser = LazyOrderEnvelope.newBuilder();
+        bUser.reuse(raw1);
+        assertEquals("Shanghai", bUser.getUserBuilder().getCity());
+        bUser.reuse(raw2);
+        LazyOrderEnvelope snapUser = bUser.build();
+        assertEquals("Hangzhou", snapUser.getUser().getCity());
+        assertEquals(222L, snapUser.getUser().getUserId());
+
+        // Same repro for repeated items (both without and with pre-build getItemsCount() scan!)
+        LazyOrderEnvelope.Builder bItems = LazyOrderEnvelope.newBuilder();
+        bItems.reuse(raw1);
+        assertEquals("SKU-100", bItems.getItemsBuilder(0).getSku());
+        assertEquals("SKU-101", bItems.getItemsBuilder(1).getSku());
+        bItems.reuse(raw2);
+        assertEquals(2, bItems.getItemsCount()); // scans raw2 before build()
+        LazyOrderEnvelope snapItems = bItems.build();
+        assertEquals("SKU-R2-A", snapItems.getItems(0).getSku());
+        assertEquals("SKU-R2-B", snapItems.getItems(1).getSku());
+
+        // Subsequent reuse(raw3) after frozen build + reading immutable child b.getUser() before reuse must also work
+        bItems.reuse(raw3);
+        assertEquals("Chengdu", bItems.getUser().getCity()); // freezes cachedUserBase early
+        bItems.reuse(raw1);
+        assertEquals("Shanghai", bItems.getUserBuilder().getCity());
+        assertEquals("Hangzhou", snapUser.getUser().getCity()); // prior snapshot remains intact
+        assertEquals("SKU-R2-A", snapItems.getItems(0).getSku());
+
+        // 2. Issue #4 #2: Typed Message mergeFrom(Message) vs raw wire mergeFrom(byte[]) proto3 default semantics
+        byte[] vip7Bytes = new byte[] { 0x18, 0x07 }; // tag 3 varint 7
+        byte[] vip0Bytes = new byte[] { 0x18, 0x00 }; // explicit proto3 default vipLevel=0 on wire
+
+        // Official Generated Oracle baseline
+        UserProfile.Builder stdMsgMerge = UserProfile.parseFrom(vip7Bytes).toBuilder();
+        stdMsgMerge.mergeFrom(UserProfile.parseFrom(vip0Bytes));
+        UserProfile stdMsgBuilt = stdMsgMerge.build();
+        assertEquals(7, stdMsgBuilt.getVipLevel());
+        assertArrayEquals(vip7Bytes, stdMsgBuilt.toByteArray());
+
+        // Lazy UserProfile.mergeFrom(LazyUserProfile & StandardOrderProto.UserProfile) MUST match official Message semantics!
+        LazyUserProfile.Builder lazyMsgMerge = LazyUserProfile.parseFrom(vip7Bytes).toBuilder();
+        lazyMsgMerge.mergeFrom(LazyUserProfile.parseFrom(vip0Bytes));
+        assertEquals(7, lazyMsgMerge.getVipLevel());
+        assertArrayEquals(vip7Bytes, lazyMsgMerge.build().toByteArray());
+
+        LazyUserProfile.Builder lazyCrossMsgMerge = LazyUserProfile.parseFrom(vip7Bytes).toBuilder();
+        lazyCrossMsgMerge.mergeFrom(UserProfile.parseFrom(vip0Bytes));
+        assertEquals(7, lazyCrossMsgMerge.getVipLevel());
+        assertArrayEquals(vip7Bytes, lazyCrossMsgMerge.build().toByteArray());
+
+        // Whereas raw wire mergeFrom(byte[]) preserves wire-level explicit 0 overwrite
+        LazyUserProfile.Builder lazyWireMerge = LazyUserProfile.parseFrom(vip7Bytes).toBuilder();
+        lazyWireMerge.mergeFrom(vip0Bytes);
+        assertEquals(0, lazyWireMerge.getVipLevel());
+        assertEquals(0, UserProfile.parseFrom(lazyWireMerge.build().toByteArray()).getVipLevel());
+
+        // Also test OrderEnvelope with explicit 0 inside nested user, repeated item, unknown fields, and empty user {}
+        byte[] explicitZerosEnvelopeWire = concatBytes(
+                new byte[] { 0x18, 0x00 },                                          // status = 0
+                encodeLenField(5, new byte[] { 0x18, 0x00, (byte) 0xD8, 0x05, 0x7B }), // user { vipLevel=0, field#91=123 }
+                encodeLenField(6, new byte[] { 0x18, 0x00, 0x12, 0x02, 'O', 'K' }),  // item { quantity=0, sku="OK" }
+                new byte[] { (byte) 0xE8, 0x05, 0x09 }                              // unknown field #93 = 9
+        );
+        OrderEnvelope.Builder stdEnvB = OrderEnvelope.parseFrom(raw2).toBuilder();
+        stdEnvB.mergeFrom(OrderEnvelope.parseFrom(explicitZerosEnvelopeWire));
+        OrderEnvelope stdEnvMerged = stdEnvB.build();
+
+        LazyOrderEnvelope.Builder lazyEnvB = LazyOrderEnvelope.parseFrom(raw2).toBuilder();
+        lazyEnvB.mergeFrom(LazyOrderEnvelope.parseFrom(explicitZerosEnvelopeWire));
+        LazyOrderEnvelope lazyEnvBuilt = lazyEnvB.build();
+        assertDifferentialOracleEquivalence(lazyEnvBuilt, stdEnvMerged, "Issue4:OrderEnvelope.mergeFrom(Message)");
+        assertEquals(5, lazyEnvBuilt.getStatus());
+        assertEquals(9, lazyEnvBuilt.getUser().getVipLevel());
+
+        // Empty parent merging OrderEnvelope whose user only had explicit default (5: {3: 0}) keeps user {}, stripping 3:0
+        byte[] onlyZeroUserWire = encodeLenField(5, vip0Bytes);
+        OrderEnvelope stdOnlyZeroUser = OrderEnvelope.newBuilder()
+                .mergeFrom(OrderEnvelope.parseFrom(onlyZeroUserWire)).build();
+        LazyOrderEnvelope lazyOnlyZeroUser = LazyOrderEnvelope.newBuilder()
+                .mergeFrom(LazyOrderEnvelope.parseFrom(onlyZeroUserWire)).build();
+        assertDifferentialOracleEquivalence(lazyOnlyZeroUser, stdOnlyZeroUser, "Issue4:EmptyOrder.mergeFrom(ZeroUserMsg)");
+        assertTrue(lazyOnlyZeroUser.hasUser());
+        assertArrayEquals(new byte[] { 0x2A, 0x00 }, lazyOnlyZeroUser.toByteArray());
+
+        // 3. Concurrent multi-threaded lazy child reads on freshly built frozen snapshots
+        LazyOrderEnvelope sharedSnap = LazyOrderEnvelope.parseFrom(raw2);
+        ProtoDocument sharedDocSnap = ProtoDocument.wrapBytes(raw2);
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            CountDownLatch startGate = new CountDownLatch(1);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                futures.add(pool.submit(() -> {
+                    startGate.await();
+                    assertEquals("Hangzhou", sharedSnap.getUser().getCity());
+                    assertEquals(9, sharedSnap.getUser().getVipLevel());
+                    assertEquals("SKU-R2-A", sharedSnap.getItems(0).getSku());
+                    assertEquals("SKU-R2-B", sharedSnap.getItems(1).getSku());
+                    assertEquals("Hangzhou", sharedDocSnap.at(5).getString(2));
+                    assertEquals(222L, sharedDocSnap.at(5).getInt64(1));
+                    return null;
+                }));
+            }
+            startGate.countDown();
+            for (Future<?> f : futures) {
+                f.get(10, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static byte[] concatBytes(byte[]... chunks) {
+        int total = 0;
+        for (byte[] c : chunks) total += c.length;
+        byte[] out = new byte[total];
+        int p = 0;
+        for (byte[] c : chunks) {
+            System.arraycopy(c, 0, out, p, c.length);
+            p += c.length;
+        }
+        return out;
+    }
+
+    private static byte[] encodeLenField(int fieldNumber, byte[] payload) {
+        int tag = (fieldNumber << 3) | WireFormat.WIRETYPE_LENGTH_DELIMITED;
+        byte[] out = new byte[WireWriter.varint32Size(tag) + WireWriter.varint32Size(payload.length) + payload.length];
+        WireWriter w = new WireWriter(out, 0);
+        w.writeTag(fieldNumber, WireFormat.WIRETYPE_LENGTH_DELIMITED);
+        w.writeVarint32(payload.length);
+        w.writeRawBytes(payload, 0, payload.length);
+        return out;
     }
 }

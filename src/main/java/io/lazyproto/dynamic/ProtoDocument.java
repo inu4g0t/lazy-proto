@@ -150,14 +150,7 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
         protected void resetBaseSlots() {
             Arrays.fill(directLastTapeIdx, -1);
             for (int i = 0; i < cachedSubDocCount; i++) {
-                DocBase sub = cachedSubDocs[i];
-                if (sub != null) {
-                    if (sub.isFrozen()) {
-                        cachedSubDocs[i] = null;
-                    } else {
-                        sub.resetForReuse(EMPTY_BYTES, 0, 0);
-                    }
-                }
+                cachedSubDocs[i] = null;
             }
             cachedSubDocCount = 0;
         }
@@ -207,6 +200,15 @@ public final class ProtoDocument extends AbstractLazyMessage<ProtoDocument, Prot
 
         public DocBase buildOrGetSubBase(int fieldNumber) {
             ensureScanned();
+            if (this.frozen) {
+                synchronized (this) {
+                    return buildOrGetSubBaseUnlocked(fieldNumber);
+                }
+            }
+            return buildOrGetSubBaseUnlocked(fieldNumber);
+        }
+
+        private DocBase buildOrGetSubBaseUnlocked(int fieldNumber) {
             for (int i = 0; i < cachedSubDocCount; i++) {
                 if (cachedSubDocFieldNums[i] == fieldNumber && cachedSubDocs[i] != null) {
                     return cachedSubDocs[i];
