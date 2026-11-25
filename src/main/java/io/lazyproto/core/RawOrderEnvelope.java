@@ -119,6 +119,7 @@ public final class RawOrderEnvelope {
     }
 
     private void resetState() {
+        int oldItemCount = itemCount;
         arena.reset();
         Arrays.fill(slotTapeIdx, -1);
         userSegCount = 0;
@@ -137,9 +138,10 @@ public final class RawOrderEnvelope {
         traceIdInArena = false;
         payloadExternal = null;
         payloadInArena = false;
-        if (sameSizeItemCount > 0 || varSizeItemCount > 0 || poolUsed > 0) {
-            Arrays.fill(activeItems, 0, Math.min(activeItems.length, poolUsed + itemCount), null);
-            Arrays.fill(activeItemStates, 0, Math.min(activeItemStates.length, itemCount), (byte) 0);
+        int clearLimit = Math.min(activeItems.length, oldItemCount);
+        if (clearLimit > 0) {
+            Arrays.fill(activeItems, 0, clearLimit, null);
+            Arrays.fill(activeItemStates, 0, clearLimit, (byte) 0);
         }
         sameSizeItemCount = 0;
         varSizeItemCount = 0;
@@ -610,10 +612,55 @@ public final class RawOrderEnvelope {
         return w.position() - outOffset;
     }
 
+    public int maxSerializedSize() {
+        if (isClean() || isSameSizeDirtyOnly()) {
+            return tape.rawLength;
+        }
+        int sz = tape.rawLength;
+        int d = varSizeDirtyMask | appendedMask;
+        if ((d & BIT_ORDER_ID) != 0) sz += 1 + WireWriter.varint64Size(orderId);
+        if ((d & BIT_BUYER_NAME) != 0 && buyerNameInArena) {
+            int len = ScratchUtf8Arena.unpackLength(buyerNameArenaHandle);
+            sz += 1 + WireWriter.varint32Size(len) + len;
+        }
+        if ((d & BIT_STATUS) != 0) sz += 1 + WireWriter.varint32Size(status);
+        if ((d & BIT_UPDATED_AT) != 0) sz += 1 + 8;
+        if ((d & BIT_USER) != 0) {
+            int usz = user.maxSerializedSize();
+            sz += 1 + WireWriter.varint32Size(usz) + usz;
+        }
+        if ((d & BIT_ITEMS) != 0) {
+            for (int i = 0; i < itemCount; i++) {
+                if (activeItemStates[i] == 2 && activeItems[i] != null) {
+                    int isz = activeItems[i].maxSerializedSize();
+                    sz += 1 + WireWriter.varint32Size(isz) + isz;
+                }
+            }
+            for (int i = 0; i < appendedItemCount; i++) {
+                int isz = appendedItems[i].maxSerializedSize();
+                sz += 1 + WireWriter.varint32Size(isz) + isz;
+            }
+        }
+        if ((d & BIT_PAYLOAD) != 0 && payloadExternal != null) {
+            sz += 1 + WireWriter.varint32Size(payloadExtLen) + payloadExtLen;
+        }
+        if ((d & BIT_AUTH_TOKEN) != 0 && authTokenInArena) {
+            int len = ScratchUtf8Arena.unpackLength(authTokenArenaHandle);
+            sz += 1 + WireWriter.varint32Size(len) + len;
+        }
+        if ((d & BIT_TRACE_ID) != 0 && traceIdInArena) {
+            int len = ScratchUtf8Arena.unpackLength(traceIdArenaHandle);
+            sz += 1 + WireWriter.varint32Size(len) + len;
+        }
+        if ((d & BIT_TOTAL) != 0) sz += 1 + WireWriter.varint64Size(totalCents);
+        return sz;
+    }
+
     public byte[] toByteArray() {
-        byte[] tmp = new byte[Math.max(256, tape.rawLength + 4096)];
+        int cap = maxSerializedSize();
+        byte[] tmp = new byte[cap];
         int len = writeToBuffer(tmp, 0);
-        return Arrays.copyOf(tmp, len);
+        return len == cap ? tmp : Arrays.copyOf(tmp, len);
     }
 
     private void applyInPlacePatches(byte[] target, int baseOffset) {
@@ -993,6 +1040,24 @@ public final class RawOrderEnvelope {
             }
         }
 
+        int maxSerializedSize() {
+            if (isClean() || isSameSizeDirtyOnly()) return tape.rawLength;
+            int sz = tape.rawLength;
+            int d = varSizeDirtyMask | appendedMask;
+            if ((d & BIT_USER_ID) != 0) sz += 1 + WireWriter.varint64Size(userId);
+            if ((d & BIT_CITY) != 0 && cityInArena) {
+                int len = ScratchUtf8Arena.unpackLength(cityArenaHandle);
+                sz += 1 + WireWriter.varint32Size(len) + len;
+            }
+            if ((d & BIT_VIP) != 0) sz += 1 + WireWriter.varint32Size(vipLevel);
+            if ((d & BIT_SCORE) != 0) sz += 1 + 8;
+            if ((d & BIT_EMAIL) != 0 && emailInArena) {
+                int len = ScratchUtf8Arena.unpackLength(emailArenaHandle);
+                sz += 1 + WireWriter.varint32Size(len) + len;
+            }
+            return sz;
+        }
+
         void writeSplicedTo(WireWriter w) {
             if (isClean()) {
                 w.writeRawBytes(tape.buf, tape.rawOffset, tape.rawLength);
@@ -1088,6 +1153,17 @@ public final class RawOrderEnvelope {
         }
 
         void decodeAllEager(byte[] b, int off, int len) {
+            this.itemId = 0L;
+            this.skuOff = 0;
+            this.skuLen = 0;
+            this.skuCache = null;
+            this.skuInArena = false;
+            this.quantity = 0;
+            this.priceCents = 0L;
+            this.descOff = 0;
+            this.descLen = 0;
+            this.descCache = null;
+            this.descInArena = false;
             int cursor = off;
             int limit = off + len;
             while (cursor < limit) {
@@ -1318,6 +1394,18 @@ public final class RawOrderEnvelope {
                 }
                 mask &= (mask - 1);
             }
+        }
+
+        int maxSerializedSize() {
+            if (isClean() || isSameSizeDirtyOnly()) return tape.rawLength;
+            int sz = tape.rawLength;
+            int d = varSizeDirtyMask | appendedMask;
+            if ((d & BIT_ITEM_ID) != 0) sz += 1 + WireWriter.varint64Size(itemId);
+            if ((d & BIT_SKU) != 0 && skuInArena) sz += 1 + WireWriter.varint32Size(skuLen) + skuLen;
+            if ((d & BIT_QTY) != 0) sz += 1 + WireWriter.varint32Size(quantity);
+            if ((d & BIT_PRICE) != 0) sz += 1 + WireWriter.varint64Size(priceCents);
+            if ((d & BIT_DESC) != 0 && descInArena) sz += 1 + WireWriter.varint32Size(descLen) + descLen;
+            return sz;
         }
 
         void writeSplicedTo(WireWriter w) {

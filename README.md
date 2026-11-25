@@ -10,7 +10,7 @@
    - **C++20 纯底层版**（[`cpp/lazy_proto.hpp`](cpp/lazy_proto.hpp)）：**不追求任何 `google::protobuf::Message` 接口兼容**，提供通用 [`WireView`](cpp/lazy_proto.hpp)（读取/缓存/修改任意字段号并合并原字节）与零成本强类型 `OrderEnvelopeView`，支持溢出安全的内联 `TapeStorage`、自动脏状态冒泡、单遍投机长度回填与全场景 **0 B/op** 复用。
    - **Java 21 Lower Level**（[`src/main/java/io/lazyproto/core`](src/main/java/io/lazyproto/core) + [`wire`](src/main/java/io/lazyproto/wire)）：零 `com.google.protobuf` 依赖的 `WireTape`、`ScratchUtf8Arena`、`RawOrderEnvelope`、`RawWireView`，单线程可变复用、单遍长度回填。
 2. **Java Intermediate Compatibility Layer（接口兼容中间层）**
-   - [`src/main/java/io/lazyproto/runtime`](src/main/java/io/lazyproto/runtime) + [`model`](src/main/java/io/lazyproto/model) + [`dynamic`](src/main/java/io/lazyproto/dynamic)：在底层之上提供 `ImmutableWireBase` + 外挂 COW `WireOverlay` + `WireMergeEngine` + `ProtobufCompat`，完整适配 `Message` / `Message.Builder` / `XxxOrBuilder` 契约、`build()` 不可变快照与多线程并发懒加载，并提供无 Schema 动态文档 [`ProtoDocument`](src/main/java/io/lazyproto/dynamic/ProtoDocument.java)。
+   - [`src/main/java/io/lazyproto/runtime`](src/main/java/io/lazyproto/runtime) + [`model`](src/main/java/io/lazyproto/model) + [`dynamic`](src/main/java/io/lazyproto/dynamic)：在底层之上提供 `ImmutableWireBase` + 外挂 COW `WireOverlay` + `WireMergeEngine` + `ProtobufCompat`，提供 `Message` / `Message.Builder` / `XxxOrBuilder` 常用读写、构筑与序列化适配、`build()` 不可变快照与多线程并发懒加载（主动裁剪 `equals`、`hashCode`、反射 `Descriptor` 与 `UnknownFieldSet`，相关方法抛出 `UnsupportedOperationException`），并提供无 Schema 动态文档 [`ProtoDocument`](src/main/java/io/lazyproto/dynamic/ProtoDocument.java)。
 
 ---
 
@@ -20,18 +20,18 @@
 
 | 场景类别 | 场景描述 | Java 官方 PB ReuseB | Java Compat ReuseB | **Java Lower `Raw`** | C++ 官方 `libprotobuf` Reuse | **C++20 Lower Reuse** |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| **优势 A1** | 只读 3 字段 (12.4 KB，无序列化) | 8,062 ns | 733 ns (11.00x, 0 B) | **568 ns (14.20x, 0 B)** | 5,034 ns | **354 ns (14.23x, 0 B)** |
-| **优势 A2** | 读 2 字段后原样转发 (Fast-Path 0) | 18,174 ns | 680 ns (26.74x, 0 B) | **603 ns (30.14x, 0 B)** | 8,299 ns | **396 ns (20.94x, 0 B)** |
-| **优势 A3** | 改 3 个定长/同长字段 (Fast-Path 1) | 18,657 ns | 838 ns (22.25x, 0 B) | **880 ns (21.21x, 0 B)** | 8,496 ns | **420 ns (20.23x, 0 B)** |
-| **优势 A4** | 修改变长字符串与嵌套 City (Fast-Path 2) | 18,450 ns | 1,075 ns (17.16x, 80 B) | **2,309 ns (7.99x, 0 B)** | 8,592 ns | **518 ns (16.58x, 0 B)** |
-| **优势 A5** | 100 项列表改第 42 项 + 序列化 | 19,094 ns | 1,518 ns (12.58x, 208 B) | **821 ns (23.26x, 0 B)** | 8,410 ns | **559 ns (15.05x, 0 B)** |
-| **优势 A6** | 网关脱敏删除 1 个字段 + 转发 | 18,270 ns | 1,112 ns (16.43x, 0 B) | **887 ns (20.60x, 0 B)** | 8,381 ns | **487 ns (17.22x, 0 B)** |
-| **劣势 B1** | 从零构建新消息 (10 子项，独立 `clear()`) | 2,353 ns | 1,470 ns (1.60x) | **1,309 ns (1.80x, 0 B)** | 692 ns | **298 ns (2.32x, 0 B)** |
-| **劣势 B2** | 100% 全树读取 (100 子项) | 7,994 ns | 12,119 ns (0.66x) | **3,684 ns (2.17x)** | 5,204 ns | **1,191 ns (4.37x, 0 B)** |
-| **劣势 B3** | 100% 全树变长修改 (20 子项) | 3,974 ns | 9,841 ns (0.40x) | **5,295 ns (0.75x)** | 2,286 ns | **1,430 ns (1.60x, 0 B)** |
-| **边界 B4** | 8 字节极小包全读 + 全变长修改 | 185 ns | 196 ns (0.94x, 0 B) | **134 ns (1.38x, 0 B)** | 43.4 ns | **41.4 ns (1.05x, 0 B)** |
+| **优势 A1** | 只读 3 字段 (12.4 KB，无序列化) | 8,428 ns | 683 ns (12.34x, 0 B) | **1,168 ns (7.22x, 0 B)** | 5,180 ns | **345 ns (15.02x, 0 B)** |
+| **优势 A2** | 读 2 字段后原样转发 (Fast-Path 0) | 17,995 ns | 796 ns (22.62x, 0 B) | **627 ns (28.71x, 0 B)** | 8,552 ns | **403 ns (21.22x, 0 B)** |
+| **优势 A3** | 改 3 个定长/同长字段 (Fast-Path 1) | 17,998 ns | 1,168 ns (15.42x, 0 B) | **1,083 ns (16.62x, 0 B)** | 8,569 ns | **438 ns (19.58x, 0 B)** |
+| **优势 A4** | 修改变长字符串与嵌套 City (Fast-Path 2) | 18,120 ns | 1,119 ns (16.20x, 80 B) | **1,428 ns (12.69x, 0 B)** | 8,647 ns | **521 ns (16.61x, 0 B)** |
+| **优势 A5** | 100 项列表改第 42 项 + 序列化 | 19,068 ns | 1,586 ns (12.02x, 208 B) | **1,578 ns (12.08x, 0 B)** | 8,501 ns | **527 ns (16.14x, 0 B)** |
+| **优势 A6** | 网关脱敏删除 1 个字段 + 转发 | 18,327 ns | 1,056 ns (17.36x, 0 B) | **813 ns (22.55x, 0 B)** | 8,509 ns | **482 ns (17.66x, 0 B)** |
+| **劣势 B1** | 从零构建新消息 (10 子项，独立 `clear()`) | 1,412 ns | 1,355 ns (1.04x) | **1,267 ns (1.11x, 0 B)** | 708 ns | **287 ns (2.47x, 0 B)** |
+| **劣势 B2** | 100% 全树读取 (含全量 `String` 解码) | 7,017 ns | 18,437 ns (0.38x) | **15,160 ns (0.46x)** | 5,363 ns | **1,263 ns (4.25x, 0 B)** |
+| **劣势 B3** | 100% 全树变长修改 (20 子项) | 4,224 ns | 9,788 ns (0.43x) | **4,345 ns (0.97x)** | 2,349 ns | **1,380 ns (1.70x, 0 B)** |
+| **边界 B4** | 8 字节极小包全读 + 全变长修改 | 261 ns | 229 ns (1.14x, 0 B) | **195 ns (1.34x, 0 B)** | 43.7 ns | **38.1 ns (1.15x, 0 B)** |
 
-> 完整含 Java Track I（每次分配 `toByteArray()`）、C++ `PB-Fresh` vs `Lazy-Fresh` vs `Lazy-WrapAlloc`、手写 Eager 基线的数据见 [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) 与 [DESIGN.md](DESIGN.md)。
+> 说明：Java Lower Level 在 A1–A6、B1、B4 复用模式下均保持 `0 B/op`，而在 B2/B3 需按需全量解码并生成 JVM `String` 时会产生堆分配（B2 `15,520 B`、B3 `1,280 B`）并受限于全量懒解码开销；C++20 Lower Reuse 在全部 10 个场景中均为 `0 B/op`。完整含 Java Track I（每次分配 `toByteArray()`）、C++ `PB-Fresh` vs `Lazy-Fresh` vs `Lazy-WrapAlloc`、手写 Eager 基线的数据见 [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) 与 [DESIGN.md](DESIGN.md)。
 
 ---
 

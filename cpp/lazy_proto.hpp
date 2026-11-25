@@ -534,45 +534,45 @@ public:
         bool     var_size_dirty = false;
         bool     appended = false;
         bool     bytes_in_arena = false;
+        bool     bytes_override = false;
+        bool     sub_dirty = false;
         CacheKind kind = CacheKind::NONE;
         uint64_t num_val = 0;
         std::string_view bytes_val;
         ScratchArena::SliceRef arena_ref{};
+        std::string materialized_sub_tmp;
         uint32_t child_pool_idx = UINT32_MAX;
         std::vector<uint32_t> repeated_tape_indices;
         std::vector<uint32_t> repeated_child_pool_indices;
+        uint32_t rep_dirty_count = 0;
     };
 
-    WireView() = default;
-    WireView(const uint8_t* data, size_t len) noexcept { wrap(data, len); }
+    WireView() noexcept { reset_internal(nullptr, 0); }
+    WireView(const uint8_t* data, size_t len) noexcept { reset_internal(data, len); }
 
     void wrap(const uint8_t* data, size_t len) noexcept {
-        buf_ = data;
-        raw_len_ = static_cast<uint32_t>(len);
-        scanned_ = false;
-        multi_segment_ = false;
-        has_deleted_ = false;
-        same_size_dirty_count_ = 0;
-        var_size_dirty_count_ = 0;
-        appended_count_ = 0;
-        tape_.reset();
-        extra_segments_.clear();
-        slots_.clear();
-        arena_.reset();
-        child_pool_used_ = 0;
-        std::memset(direct_slot_, -1, sizeof(direct_slot_));
-        parent_ = nullptr;
-        parent_field_ = 0;
-        parent_repeated_idx_ = -1;
+        WireView* saved_parent = parent_;
+        uint32_t saved_field = parent_field_;
+        int32_t saved_rep = parent_repeated_idx_;
+        reset_internal(data, len);
+        if (saved_parent != nullptr) {
+            parent_ = saved_parent;
+            parent_field_ = saved_field;
+            parent_repeated_idx_ = saved_rep;
+            replaced_from_wrap_ = true;
+            notify_parent();
+        }
     }
 
     bool is_scanned() const noexcept { return scanned_; }
     bool is_clean() const noexcept {
-        return !multi_segment_ && same_size_dirty_count_ == 0 && var_size_dirty_count_ == 0
+        return !multi_segment_ && !replaced_from_wrap_
+            && same_size_dirty_count_ == 0 && var_size_dirty_count_ == 0
             && appended_count_ == 0 && !has_deleted_;
     }
     bool is_same_size_dirty_only() const noexcept {
-        return !multi_segment_ && var_size_dirty_count_ == 0 && appended_count_ == 0
+        return !multi_segment_ && !replaced_from_wrap_
+            && var_size_dirty_count_ == 0 && appended_count_ == 0
             && !has_deleted_ && same_size_dirty_count_ != 0;
     }
 
@@ -638,15 +638,25 @@ public:
     std::string_view get_bytes(uint32_t field_number) {
         FieldCache* fc = resolve_for_read(field_number);
         if (!fc) return {};
+        if (fc->sub_dirty && fc->child_pool_idx != UINT32_MAX) {
+            child_pool_[fc->child_pool_idx]->merge_to(fc->materialized_sub_tmp);
+            return fc->materialized_sub_tmp;
+        }
+        if (fc->bytes_override) {
+            return fc->bytes_in_arena ? arena_.resolve(fc->arena_ref) : fc->bytes_val;
+        }
         if (fc->decoded && fc->kind == CacheKind::BYTES) {
             return fc->bytes_in_arena ? arena_.resolve(fc->arena_ref) : fc->bytes_val;
         }
+        if (fc->last_tape_idx < 0) return {};
         const TapeEntry& e = tape_[static_cast<uint32_t>(fc->last_tape_idx)];
         if (e.wire_type != WIRETYPE_LENGTH_DELIMITED) return {};
         fc->bytes_val = std::string_view(reinterpret_cast<const char*>(buf_ + e.value_offset), e.value_length());
         fc->bytes_in_arena = false;
-        fc->kind = CacheKind::BYTES;
-        fc->decoded = true;
+        if (!fc->sub_dirty && fc->kind == CacheKind::NONE) {
+            fc->kind = CacheKind::BYTES;
+            fc->decoded = true;
+        }
         return fc->bytes_val;
     }
 
@@ -659,19 +669,27 @@ public:
         }
         WireView* child = alloc_child(field_number, -1);
         if (fc.present && !fc.deleted) {
-            if (fc.repeated_tape_indices.size() > 1U) {
+            if (fc.bytes_override) {
+                std::string_view sv = fc.bytes_in_arena ? arena_.resolve(fc.arena_ref) : fc.bytes_val;
+                child->owned_input_copy_.assign(sv.data(), sv.size());
+                child->reset_internal(reinterpret_cast<const uint8_t*>(child->owned_input_copy_.data()),
+                                      child->owned_input_copy_.size());
+            } else if (fc.repeated_tape_indices.size() > 1U) {
                 child->wrap_multi_segments(buf_, tape_, fc.repeated_tape_indices);
             } else if (fc.last_tape_idx >= 0) {
                 const TapeEntry& e = tape_[static_cast<uint32_t>(fc.last_tape_idx)];
                 if (e.wire_type == WIRETYPE_LENGTH_DELIMITED) {
-                    child->wrap(buf_ + e.value_offset, e.value_length());
-                    child->parent_ = this;
-                    child->parent_field_ = field_number;
+                    child->reset_internal(buf_ + e.value_offset, e.value_length());
                 }
             }
         }
-        fc.kind = CacheKind::SUBVIEW;
-        fc.decoded = true;
+        child->parent_ = this;
+        child->parent_field_ = field_number;
+        child->parent_repeated_idx_ = -1;
+        if (!fc.bytes_override) {
+            fc.kind = CacheKind::SUBVIEW;
+            fc.decoded = true;
+        }
         fc.child_pool_idx = static_cast<uint32_t>(child_pool_used_ - 1);
         return *child;
     }
@@ -688,7 +706,8 @@ public:
     WireView& repeated_sub(uint32_t field_number, size_t idx) {
         ensure_scanned();
         int32_t s = find_slot(field_number);
-        if (s < 0 || idx >= slots_[static_cast<size_t>(s)].repeated_tape_indices.size()) {
+        if (s < 0 || slots_[static_cast<size_t>(s)].deleted
+                || idx >= slots_[static_cast<size_t>(s)].repeated_tape_indices.size()) {
             throw std::out_of_range("WireView repeated_sub index out of range");
         }
         FieldCache& fc = slots_[static_cast<size_t>(s)];
@@ -703,11 +722,11 @@ public:
         const TapeEntry& e = tape_[t_idx];
         WireView* child = alloc_child(field_number, static_cast<int32_t>(idx));
         if (e.wire_type == WIRETYPE_LENGTH_DELIMITED) {
-            child->wrap(buf_ + e.value_offset, e.value_length());
-            child->parent_ = this;
-            child->parent_field_ = field_number;
-            child->parent_repeated_idx_ = static_cast<int32_t>(idx);
+            child->reset_internal(buf_ + e.value_offset, e.value_length());
         }
+        child->parent_ = this;
+        child->parent_field_ = field_number;
+        child->parent_repeated_idx_ = static_cast<int32_t>(idx);
         fc.repeated_child_pool_indices[idx] = static_cast<uint32_t>(child_pool_used_ - 1);
         return *child;
     }
@@ -715,6 +734,7 @@ public:
     WireView& set_varint(uint32_t field_number, uint64_t val) {
         ensure_scanned();
         FieldCache& fc = slots_[static_cast<size_t>(find_or_create_slot(field_number))];
+        invalidate_child_views(fc);
         fc.num_val = val;
         fc.kind = CacheKind::VARINT;
         fc.decoded = true;
@@ -732,6 +752,7 @@ public:
     WireView& set_fixed32(uint32_t field_number, uint32_t val) {
         ensure_scanned();
         FieldCache& fc = slots_[static_cast<size_t>(find_or_create_slot(field_number))];
+        invalidate_child_views(fc);
         fc.num_val = val;
         fc.kind = CacheKind::FIXED32;
         fc.decoded = true;
@@ -745,6 +766,7 @@ public:
     WireView& set_fixed64(uint32_t field_number, uint64_t val) {
         ensure_scanned();
         FieldCache& fc = slots_[static_cast<size_t>(find_or_create_slot(field_number))];
+        invalidate_child_views(fc);
         fc.num_val = val;
         fc.kind = CacheKind::FIXED64;
         fc.decoded = true;
@@ -764,8 +786,10 @@ public:
     WireView& set_bytes(uint32_t field_number, std::string_view sv) {
         ensure_scanned();
         FieldCache& fc = slots_[static_cast<size_t>(find_or_create_slot(field_number))];
+        invalidate_child_views(fc);
         fc.bytes_val = sv;
         fc.bytes_in_arena = false;
+        fc.bytes_override = true;
         fc.kind = CacheKind::BYTES;
         fc.decoded = true;
         fc.present = true;
@@ -778,8 +802,10 @@ public:
     WireView& set_bytes_copy(uint32_t field_number, std::string_view sv) {
         ensure_scanned();
         FieldCache& fc = slots_[static_cast<size_t>(find_or_create_slot(field_number))];
+        invalidate_child_views(fc);
         fc.arena_ref = arena_.store(sv);
         fc.bytes_in_arena = true;
+        fc.bytes_override = true;
         fc.kind = CacheKind::BYTES;
         fc.decoded = true;
         fc.present = true;
@@ -794,12 +820,12 @@ public:
         int32_t s = find_slot(field_number);
         if (s < 0) return *this;
         FieldCache& fc = slots_[static_cast<size_t>(s)];
+        invalidate_child_views(fc);
         clear_dirty_counts(fc);
         fc.present = false;
         fc.deleted = true;
         fc.decoded = false;
         fc.bytes_val = {};
-        fc.bytes_in_arena = false;
         if (!fc.repeated_tape_indices.empty()) {
             for (uint32_t t_idx : fc.repeated_tape_indices) {
                 tape_[t_idx].flags = FLAG_DELETED;
@@ -816,20 +842,20 @@ public:
         }
         size_t upper = raw_len_;
         for (const FieldCache& fc : slots_) {
-            if (fc.var_size_dirty || fc.appended) {
-                if (fc.kind == CacheKind::BYTES) {
-                    size_t len = fc.bytes_in_arena ? fc.arena_ref.length : fc.bytes_val.size();
-                    upper += tag_size(fc.field_number) + varint32_size(static_cast<uint32_t>(len)) + len;
-                } else if (fc.kind == CacheKind::SUBVIEW && fc.child_pool_idx != UINT32_MAX) {
-                    size_t sub_max = child_pool_[fc.child_pool_idx]->max_merged_size();
-                    upper += tag_size(fc.field_number) + varint32_size(static_cast<uint32_t>(sub_max)) + sub_max;
-                } else if (fc.kind == CacheKind::SUBVIEW) {
+            if (fc.var_size_dirty || fc.appended || fc.rep_dirty_count > 0) {
+                if (fc.rep_dirty_count > 0 && !fc.repeated_child_pool_indices.empty()) {
                     for (uint32_t pidx : fc.repeated_child_pool_indices) {
-                        if (pidx != UINT32_MAX) {
+                        if (pidx != UINT32_MAX && !child_pool_[pidx]->is_clean()) {
                             size_t sub_max = child_pool_[pidx]->max_merged_size();
                             upper += tag_size(fc.field_number) + varint32_size(static_cast<uint32_t>(sub_max)) + sub_max;
                         }
                     }
+                } else if (fc.sub_dirty && fc.child_pool_idx != UINT32_MAX) {
+                    size_t sub_max = child_pool_[fc.child_pool_idx]->max_merged_size();
+                    upper += tag_size(fc.field_number) + varint32_size(static_cast<uint32_t>(sub_max)) + sub_max;
+                } else if (fc.kind == CacheKind::BYTES) {
+                    size_t len = fc.bytes_in_arena ? fc.arena_ref.length : fc.bytes_val.size();
+                    upper += tag_size(fc.field_number) + varint32_size(static_cast<uint32_t>(len)) + len;
                 } else {
                     upper += tag_size(fc.field_number) + 10U;
                 }
@@ -870,6 +896,7 @@ private:
     bool scanned_ = false;
     bool multi_segment_ = false;
     bool has_deleted_ = false;
+    bool replaced_from_wrap_ = false;
     uint32_t same_size_dirty_count_ = 0;
     uint32_t var_size_dirty_count_ = 0;
     uint32_t appended_count_ = 0;
@@ -883,16 +910,38 @@ private:
 
     std::vector<std::unique_ptr<WireView>> child_pool_;
     size_t child_pool_used_ = 0;
+    std::string owned_input_copy_;
 
     WireView* parent_ = nullptr;
     uint32_t parent_field_ = 0;
     int32_t parent_repeated_idx_ = -1;
 
+    void reset_internal(const uint8_t* data, size_t len) noexcept {
+        buf_ = data;
+        raw_len_ = static_cast<uint32_t>(len);
+        scanned_ = false;
+        multi_segment_ = false;
+        has_deleted_ = false;
+        replaced_from_wrap_ = false;
+        same_size_dirty_count_ = 0;
+        var_size_dirty_count_ = 0;
+        appended_count_ = 0;
+        tape_.reset();
+        extra_segments_.clear();
+        slots_.clear();
+        arena_.reset();
+        child_pool_used_ = 0;
+        std::memset(direct_slot_, -1, sizeof(direct_slot_));
+        parent_ = nullptr;
+        parent_field_ = 0;
+        parent_repeated_idx_ = -1;
+    }
+
     void wrap_multi_segments(
             const uint8_t* parent_buf,
             const TapeStorage<16>& parent_tape,
             const std::vector<uint32_t>& seg_indices) {
-        wrap(parent_buf, 0);
+        reset_internal(parent_buf, 0);
         multi_segment_ = true;
         scanned_ = true;
         uint32_t total = 0;
@@ -921,9 +970,7 @@ private:
     void on_scan_entry(uint32_t idx, TapeEntry& e) {
         int32_t s = find_or_create_slot(e.field_number);
         FieldCache& fc = slots_[static_cast<size_t>(s)];
-        if (fc.last_tape_idx >= 0 && e.wire_type != WIRETYPE_LENGTH_DELIMITED) {
-            tape_[static_cast<uint32_t>(fc.last_tape_idx)].flags = FLAG_SHADOWED;
-        }
+        // Zero-assumption scan: preserve all duplicate scalar/LEN entries as CLEAN_RAW
         fc.last_tape_idx = static_cast<int32_t>(idx);
         fc.present = true;
         fc.repeated_tape_indices.push_back(idx);
@@ -962,11 +1009,20 @@ private:
             child_pool_.push_back(std::make_unique<WireView>());
         }
         WireView* child = child_pool_[child_pool_used_++].get();
-        child->wrap(nullptr, 0);
+        child->reset_internal(nullptr, 0);
         child->parent_ = this;
         child->parent_field_ = field_number;
         child->parent_repeated_idx_ = rep_idx;
         return child;
+    }
+
+    void invalidate_child_views(FieldCache& fc) noexcept {
+        fc.child_pool_idx = UINT32_MAX;
+        fc.sub_dirty = false;
+        fc.bytes_override = false;
+        fc.bytes_in_arena = false;
+        fc.repeated_child_pool_indices.clear();
+        fc.rep_dirty_count = 0;
     }
 
     void clear_dirty_counts(FieldCache& fc) noexcept {
@@ -1014,6 +1070,7 @@ private:
             uint8_t prev = e.flags;
             if (prev == FLAG_DIRTY_SAME_SIZE) same_size_dirty_count_--;
             else if (prev == FLAG_DIRTY_VAR_SIZE) var_size_dirty_count_--;
+            else fc.rep_dirty_count++;
             if (child.is_same_size_dirty_only()) {
                 e.flags = FLAG_DIRTY_SAME_SIZE;
                 same_size_dirty_count_++;
@@ -1022,6 +1079,12 @@ private:
                 var_size_dirty_count_++;
             }
         } else {
+            fc.sub_dirty = true;
+            fc.bytes_override = false;
+            fc.kind = CacheKind::SUBVIEW;
+            fc.decoded = true;
+            fc.present = true;
+            fc.deleted = false;
             clear_dirty_counts(fc);
             if (!fc.repeated_tape_indices.empty()) {
                 for (size_t i = 0; i + 1 < fc.repeated_tape_indices.size(); i++) {
@@ -1038,8 +1101,6 @@ private:
                     var_size_dirty_count_++;
                 }
             } else {
-                fc.present = true;
-                fc.deleted = false;
                 fc.appended = true;
                 appended_count_++;
             }
@@ -1050,7 +1111,7 @@ private:
     void apply_in_place_patches(uint8_t* target) const noexcept {
         for (const FieldCache& fc : slots_) {
             if (fc.same_size_dirty && fc.last_tape_idx >= 0) {
-                if (fc.kind == CacheKind::SUBVIEW && fc.child_pool_idx != UINT32_MAX) {
+                if (fc.sub_dirty && fc.child_pool_idx != UINT32_MAX) {
                     const TapeEntry& e = tape_[static_cast<uint32_t>(fc.last_tape_idx)];
                     child_pool_[fc.child_pool_idx]->apply_in_place_patches(target + e.value_offset);
                 } else {
@@ -1079,6 +1140,13 @@ private:
     }
 
     void write_field_value(const FieldCache& fc, WireWriter& w) const noexcept {
+        if (fc.sub_dirty && fc.child_pool_idx != UINT32_MAX) {
+            const WireView* child = child_pool_[fc.child_pool_idx].get();
+            write_submessage_single_pass(fc.field_number, w, [child](WireWriter& cw) {
+                child->write_spliced_to(cw);
+            });
+            return;
+        }
         switch (fc.kind) {
             case CacheKind::VARINT:
                 w.write_tag(fc.field_number, WIRETYPE_VARINT);
@@ -1822,6 +1890,10 @@ public:
     uint32_t raw_off_ = 0;
     uint32_t raw_len_ = 0;
     bool scanned_ = false;
+
+    OrderEnvelopeView() noexcept {
+        std::memset(slot_tape_idx_, -1, sizeof(slot_tape_idx_));
+    }
 
     void wrap(const uint8_t* buf, uint32_t off, uint32_t len) noexcept {
         buf_ = buf;

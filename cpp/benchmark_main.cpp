@@ -320,6 +320,101 @@ void run_correctness_tests() {
             caught = true;
         }
         LP_CHECK(caught);
+
+        // Issue #7 Regressions:
+        // (a) Default-constructed WireView has/set/merge
+        {
+            WireView def_view;
+            LP_CHECK(!def_view.has(1));
+            LP_CHECK(def_view.get_varint(1, 99) == 99);
+            def_view.set_varint(1, 42);
+            LP_CHECK(def_view.has(1) && def_view.get_varint(1) == 42);
+            std::string def_out;
+            def_view.merge_to(def_out);
+            pb::OrderEnvelope pb_def;
+            LP_CHECK(pb_def.ParseFromArray(def_out.data(), static_cast<int>(def_out.size())));
+            LP_CHECK(pb_def.order_id() == 42);
+        }
+
+        // (b) WireView repeated_sub growth capacity (32 02 08 01 + 200B string -> 208B)
+        {
+            const uint8_t rep_in[] = {0x32, 0x02, 0x08, 0x01};
+            WireView rv(rep_in, sizeof(rep_in));
+            std::string long_sku(200, 'S');
+            rv.repeated_sub(6, 0).set_bytes_copy(2, long_sku);
+            size_t max_sz = rv.max_merged_size();
+            std::vector<uint8_t> exact_buf(max_sz);
+            size_t actual_sz = rv.merge_to(exact_buf.data(), exact_buf.size());
+            LP_CHECK(actual_sz <= max_sz);
+            LP_CHECK(actual_sz >= 208);
+            pb::OrderEnvelope pb_rep;
+            LP_CHECK(pb_rep.ParseFromArray(exact_buf.data(), static_cast<int>(actual_sz)));
+            LP_CHECK(pb_rep.items_size() == 1 && pb_rep.items(0).item_id() == 1);
+            LP_CHECK(pb_rep.items(0).sku() == long_sku);
+        }
+
+        // (c) WireView split sub-message (2a 02 08 01 2a 02 18 02), set_bytes -> sub, sub edit -> get_bytes
+        {
+            const uint8_t split_in[] = {0x2A, 0x02, 0x08, 0x01, 0x2A, 0x02, 0x18, 0x02};
+            WireView sv(split_in, sizeof(split_in));
+            sv.sub(5).set_varint(3, 7);
+            LP_CHECK(sv.sub(5).get_varint(3) == 7);
+            std::string_view sub_bytes = sv.get_bytes(5);
+            LP_CHECK(!sub_bytes.empty());
+            std::string out_split;
+            sv.merge_to(out_split);
+            pb::OrderEnvelope pb_split2;
+            LP_CHECK(pb_split2.ParseFromArray(out_split.data(), static_cast<int>(out_split.size())));
+            LP_CHECK(pb_split2.user().user_id() == 1);
+            LP_CHECK(pb_split2.user().vip_level() == 7);
+
+            // set_bytes -> sub() sees new bytes
+            pb::UserProfile new_u;
+            new_u.set_user_id(555);
+            new_u.set_city("NEW_CITY");
+            std::string new_u_bytes = new_u.SerializeAsString();
+            sv.set_bytes_copy(5, new_u_bytes);
+            LP_CHECK(sv.sub(5).get_varint(1) == 555);
+            LP_CHECK(sv.sub(5).get_bytes(2) == "NEW_CITY");
+        }
+
+        // (d) WireView repeated scalar preservation (08 01 08 02 + add field 3 -> preserves [1, 2])
+        {
+            const uint8_t rep_scalar[] = {0x08, 0x01, 0x08, 0x02};
+            WireView rsv(rep_scalar, sizeof(rep_scalar));
+            rsv.set_varint(3, 99);
+            std::string out_rs;
+            rsv.merge_to(out_rs);
+            // Parse raw records: must contain field 1 = 1, field 1 = 2, and field 3 = 99
+            WireView verify(reinterpret_cast<const uint8_t*>(out_rs.data()), out_rs.size());
+            LP_CHECK(verify.repeated_count(1) == 2);
+            LP_CHECK(verify.get_varint(3) == 99);
+            // Verify wire starts with 0x08, 0x01, 0x08, 0x02
+            LP_CHECK(out_rs.size() >= 6);
+            LP_CHECK(static_cast<uint8_t>(out_rs[0]) == 0x08 && static_cast<uint8_t>(out_rs[1]) == 0x01);
+            LP_CHECK(static_cast<uint8_t>(out_rs[2]) == 0x08 && static_cast<uint8_t>(out_rs[3]) == 0x02);
+        }
+
+        // (e) OrderEnvelopeView multi-round wrap reuse across different inputs & A5 parity
+        {
+            OrderEnvelopeView reused;
+            std::vector<uint8_t> alt = create_complex_order_bytes(60, 128);
+            for (int r = 0; r < 3; r++) {
+                reused.wrap(raw.data(), 0, static_cast<uint32_t>(raw.size()));
+                reused.items(42).set_quantity(999).set_description("UPDATED_ITEM_42_DESC");
+                std::string m;
+                reused.merge_to(m);
+                pb::OrderEnvelope p;
+                LP_CHECK(p.ParseFromArray(m.data(), static_cast<int>(m.size())));
+                LP_CHECK(p.items_size() == 100);
+                LP_CHECK(p.items(42).quantity() == 999);
+                LP_CHECK(p.items(42).description() == "UPDATED_ITEM_42_DESC");
+
+                reused.wrap(alt.data(), 0, static_cast<uint32_t>(alt.size()));
+                LP_CHECK(reused.items_count() == 60);
+                LP_CHECK(reused.items(42).quantity() == (42 % 5) + 1);
+            }
+        }
     }
 
     // 7. B1: From-Scratch Construction

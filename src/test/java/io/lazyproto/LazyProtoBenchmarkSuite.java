@@ -685,6 +685,16 @@ public class LazyProtoBenchmarkSuite {
         assertTrue(trackI.get(1).officialPb().nsPerOp() / trackI.get(1).lazyImm().nsPerOp() > 5.0, "A2 Passthrough (Track I) vs Official PB > 5x");
         assertTrue(trackII.get(2).officialImmOutBuf().nsPerOp() / trackII.get(2).lazyImmOutBuf().nsPerOp() > 5.0, "A3 FP1 Imm vs Official PB > 5x");
         assertTrue(trackII.get(2).officialReuseBuilderOutBuf().nsPerOp() / trackII.get(2).lazyReuseBuilderOutBuf().nsPerOp() > 8.0, "A3 FP1 Reuse vs Official PB > 8x");
+
+        // Multi-round A5 Raw verification (ensure repeated wrap() outputs match official parser)
+        for (int r = 0; r < 3; r++) {
+            reusableRaw.wrap(complexBytes, 0, complexBytes.length);
+            reusableRaw.items(42).setQuantity(999).setDescription("UPDATED_ITEM_42_DESC");
+            int a5Len = reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            OrderEnvelope a5Decoded = OrderEnvelope.parseFrom(java.util.Arrays.copyOf(reusableOutBuf, a5Len));
+            assertEquals(999, a5Decoded.getItems(42).getQuantity());
+            assertEquals("UPDATED_ITEM_42_DESC", a5Decoded.getItems(42).getDescription());
+        }
     }
 
     private static final String[] SKU_TABLE = {
@@ -944,8 +954,9 @@ public class LazyProtoBenchmarkSuite {
                 + (long) u.getScore() + u.getEmail().length();
         int n = msg.getItemsCount();
         for (int i = 0; i < n; i++) {
-            msg.readItemEager(i, tmp);
-            sum += tmp.itemId + tmp.skuLen + tmp.quantity + tmp.priceCents + tmp.descLen;
+            var item = msg.items(i);
+            sum += item.getItemId() + item.getSku().length() + item.getQuantity()
+                    + item.getPriceCents() + item.getDescription().length();
         }
         return sum;
     }

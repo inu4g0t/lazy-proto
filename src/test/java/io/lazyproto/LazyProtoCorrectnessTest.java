@@ -793,4 +793,145 @@ public class LazyProtoCorrectnessTest {
         assertEquals("", viewDecoded.getAuthToken());
         assertTrue(viewDecoded.getUnknownFields().hasField(50));
     }
+
+    @Test
+    @DisplayName("F2: Issue #7 Lower-Level Regressions (multi-wrap reuse, shared arena, child/parent sync, repeated scalar, overlong headerLen, >4KB toByteArray)")
+    void testF2_Issue7LowerLevelRegressions() throws IOException {
+        byte[] complex = createComplexOrderBytes(100, 4096);
+        byte[] alt = createComplexOrderBytes(55, 64);
+
+        // 1. RawOrderEnvelope multi-round wrap() + sparse items(42) across different inputs
+        RawOrderEnvelope rawEnv = new RawOrderEnvelope();
+        for (int round = 0; round < 3; round++) {
+            rawEnv.wrap(complex, 0, complex.length);
+            rawEnv.items(42).setQuantity(999).setDescription("UPDATED_ITEM_42_DESC");
+            byte[] out1 = rawEnv.toByteArray();
+            io.lazyproto.bench.proto.OrderEnvelope p1 = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out1);
+            assertEquals(100, p1.getItemsCount());
+            assertEquals(999, p1.getItems(42).getQuantity());
+            assertEquals("UPDATED_ITEM_42_DESC", p1.getItems(42).getDescription());
+
+            // Switching to alt input must NOT retain stale item #42 cache
+            rawEnv.wrap(alt, 0, alt.length);
+            assertEquals(55, rawEnv.getItemsCount());
+            assertEquals((42 % 5) + 1, rawEnv.items(42).getQuantity());
+            assertEquals("High performance component item #42 with extra details", rawEnv.items(42).getDescription());
+        }
+
+        // 2. RawWireView: parent setString("TOP") then first sub(5).setString("KID") must NOT wipe parent arena
+        {
+            RawWireView wv = new RawWireView().wrap(complex, 0, complex.length);
+            wv.setString(2, "TOP");
+            wv.sub(5).setString(2, "KID");
+            byte[] out = wv.toByteArray();
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals("TOP", dec.getBuyerName());
+            assertEquals("KID", dec.getUser().getCity());
+        }
+
+        // 3. RawWireView: repeatedSub(6, 0) across wrap(32021801) -> wrap(32021802) & bound child wrap()
+        {
+            byte[] in1 = new byte[] {0x32, 0x02, 0x18, 0x01};
+            byte[] in2 = new byte[] {0x32, 0x02, 0x18, 0x02};
+            RawWireView rv = new RawWireView().wrap(in1, 0, in1.length);
+            assertEquals(1, rv.repeatedSub(6, 0).getInt32(3));
+            rv.wrap(in2, 0, in2.length);
+            assertEquals(2, rv.repeatedSub(6, 0).getInt32(3));
+
+            byte[] parentIn = new byte[] {0x2A, 0x02, 0x08, 0x01};
+            byte[] childNew = new byte[] {0x08, 0x02};
+            RawWireView pv = new RawWireView().wrap(parentIn, 0, parentIn.length);
+            pv.sub(5).wrap(childNew, 0, childNew.length);
+            assertEquals(2L, pv.sub(5).getInt64(1));
+            io.lazyproto.bench.proto.OrderEnvelope pDec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(pv.toByteArray());
+            assertEquals(2L, pDec.getUser().getUserId());
+        }
+
+        // 4. RawWireView: repeated scalar preservation (08 01 08 02 + unrelated field 3)
+        {
+            byte[] repScalar = new byte[] {0x08, 0x01, 0x08, 0x02};
+            RawWireView wv = new RawWireView().wrap(repScalar, 0, repScalar.length);
+            wv.setInt64(3, 99L);
+            byte[] out = wv.toByteArray();
+            assertEquals(0x08, out[0]);
+            assertEquals(0x01, out[1]);
+            assertEquals(0x08, out[2]);
+            assertEquals(0x02, out[3]);
+            RawWireView verify = new RawWireView().wrap(out, 0, out.length);
+            assertEquals(2, verify.repeatedCount(1));
+            assertEquals(99L, verify.getInt64(3));
+        }
+
+        // 5. RawWireView: setBytes -> sub() & sub() edit -> getString() preserves child edit
+        {
+            byte[] pIn = new byte[] {0x2A, 0x02, 0x08, 0x01};
+            RawWireView wv = new RawWireView().wrap(pIn, 0, pIn.length);
+            wv.sub(5).setInt64(1, 777L);
+            assertFalse(wv.getSlice(5).byteLength() == 0);
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(wv.toByteArray());
+            assertEquals(777L, dec.getUser().getUserId());
+
+            byte[] repBytes = io.lazyproto.bench.proto.UserProfile.newBuilder()
+                    .setUserId(888L).setCity("BYTES_SUB").build().toByteArray();
+            wv.setBytes(5, repBytes, 0, repBytes.length);
+            assertEquals(888L, wv.sub(5).getInt64(1));
+            assertEquals("BYTES_SUB", wv.sub(5).getString(2));
+        }
+
+        // 6. RawLineItem.decodeAllEager reset on empty LineItem & >4096B toByteArray()
+        {
+            byte[] item1 = io.lazyproto.bench.proto.LineItem.newBuilder()
+                    .setItemId(123L).setSku("SKU-1").setQuantity(5).setPriceCents(999L).setDescription("DESC")
+                    .build().toByteArray();
+            byte[] twoItems = new byte[2 + item1.length + 2];
+            twoItems[0] = 0x32;
+            twoItems[1] = (byte) item1.length;
+            System.arraycopy(item1, 0, twoItems, 2, item1.length);
+            twoItems[2 + item1.length] = 0x32;
+            twoItems[3 + item1.length] = 0x00; // Empty second LineItem
+
+            RawOrderEnvelope re = new RawOrderEnvelope().wrap(twoItems, 0, twoItems.length);
+            assertEquals(2, re.getItemsCount());
+            RawOrderEnvelope.RawLineItem tmp = new RawOrderEnvelope.RawLineItem();
+            re.readItemEager(0, tmp);
+            assertEquals(123L, tmp.itemId);
+            re.readItemEager(1, tmp);
+            assertEquals(0L, tmp.itemId);
+            assertEquals(0, tmp.skuLen);
+            assertEquals(0, tmp.quantity);
+            assertEquals(0L, tmp.priceCents);
+            assertEquals(0, tmp.descLen);
+
+            byte[] bigPayload = new byte[8192];
+            Arrays.fill(bigPayload, (byte) 0x5A);
+            String bigBuyer = "B".repeat(5000);
+            re.wrap(new byte[0], 0, 0).setPayloadBytes(bigPayload).setBuyerName(bigBuyer);
+            io.lazyproto.bench.proto.OrderEnvelope bigDec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(re.toByteArray());
+            assertEquals(8192, bigDec.getPayload().size());
+            assertEquals(5000, bigDec.getBuyerName().length());
+
+            RawWireView bigWv = new RawWireView().wrap(new byte[0], 0, 0).setString(2, bigBuyer);
+            assertEquals(5000, io.lazyproto.bench.proto.OrderEnvelope.parseFrom(bigWv.toByteArray()).getBuyerName().length());
+        }
+
+        // 7. 10-byte overlong tag + 10-byte overlong LEN (headerLen == 20) in WireTape & ImmutableWireBase
+        {
+            byte[] payload = "OVERLONG_20B_HDR".getBytes(StandardCharsets.UTF_8);
+            byte[] overlong = new byte[20 + payload.length];
+            // 10-byte overlong tag for field #2 LEN (0x12)
+            overlong[0] = (byte) 0x92;
+            for (int i = 1; i < 9; i++) overlong[i] = (byte) 0x80;
+            overlong[9] = 0x00;
+            // 10-byte overlong length for payload.length
+            overlong[10] = (byte) ((payload.length & 0x7F) | 0x80);
+            for (int i = 11; i < 19; i++) overlong[i] = (byte) 0x80;
+            overlong[19] = 0x00;
+            System.arraycopy(payload, 0, overlong, 20, payload.length);
+
+            RawWireView wvOver = new RawWireView().wrap(overlong, 0, overlong.length);
+            assertEquals("OVERLONG_20B_HDR", wvOver.getString(2));
+            LazyOrderEnvelope compatOver = LazyOrderEnvelope.parseFrom(overlong);
+            assertEquals("OVERLONG_20B_HDR", compatOver.getBuyerName());
+        }
+    }
 }

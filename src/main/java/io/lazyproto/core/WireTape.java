@@ -144,8 +144,8 @@ public final class WireTape {
         long word0 = ((long) tagOffset << 32) | (recordEnd & 0xFFFFFFFFL);
         long word1 = ((long) fieldNumber << 35)
                 | ((long) (wireType & 0x7) << 32)
-                | ((long) FLAG_CLEAN_RAW << 28)
-                | ((long) (headerLen & 0xF) << 24)
+                | ((long) FLAG_CLEAN_RAW << 29)
+                | ((long) (headerLen & 0x1F) << 24)
                 | NO_AUX_IDX;
         this.tape[wordIdx] = word0;
         this.tape[wordIdx + 1] = word1;
@@ -161,7 +161,7 @@ public final class WireTape {
 
         for (int i = 0; i < n; i++) {
             long w1 = tape[(i << 1) + 1];
-            int flags = (int) ((w1 >>> 28) & 0xFL);
+            int flags = (int) ((w1 >>> 29) & 0x7L);
             if (flags == FLAG_CLEAN_RAW || flags == FLAG_SPLIT_CONT || flags == FLAG_SPLIT_TAIL) {
                 long w0 = tape[i << 1];
                 int tagOff = (int) (w0 >>> 32);
@@ -202,27 +202,27 @@ public final class WireTape {
     public int valueOffset(int idx) {
         long w0 = tape[idx << 1];
         long w1 = tape[(idx << 1) + 1];
-        return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL);
+        return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL);
     }
     public int valueLength(int idx) {
         long w0 = tape[idx << 1];
         long w1 = tape[(idx << 1) + 1];
-        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL));
+        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL));
     }
-    public int flags(int idx) { return (int) ((tape[(idx << 1) + 1] >>> 28) & 0xFL); }
+    public int flags(int idx) { return (int) ((tape[(idx << 1) + 1] >>> 29) & 0x7L); }
     public int fieldNumber(int idx) { return (int) (tape[(idx << 1) + 1] >>> 35); }
     public int wireType(int idx) { return (int) ((tape[(idx << 1) + 1] >>> 32) & 0x7L); }
     public int auxIndex(int idx) { return (int) (tape[(idx << 1) + 1] & 0xFFFFFFL); }
 
     public void setFlags(int idx, int flags) {
         int w1Idx = (idx << 1) + 1;
-        tape[w1Idx] = (tape[w1Idx] & ~(0xFL << 28)) | ((long) (flags & 0xF) << 28);
+        tape[w1Idx] = (tape[w1Idx] & ~(0x7L << 29)) | ((long) (flags & 0x7) << 29);
     }
 
     public void setFlagsAndAux(int idx, int flags, int aux) {
         int w1Idx = (idx << 1) + 1;
-        tape[w1Idx] = (tape[w1Idx] & ~((0xFL << 28) | 0xFFFFFFL))
-                | ((long) (flags & 0xF) << 28)
+        tape[w1Idx] = (tape[w1Idx] & ~((0x7L << 29) | 0xFFFFFFL))
+                | ((long) (flags & 0x7) << 29)
                 | (aux & 0xFFFFFFL);
     }
 }

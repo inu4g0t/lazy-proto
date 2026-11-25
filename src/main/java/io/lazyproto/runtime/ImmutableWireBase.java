@@ -21,7 +21,7 @@ import java.util.Arrays;
  * <ul>
  *   <li>{@code tape[i * 2]}: {@code [63..32] tagOffset (uint32) | [31..0] recordEnd (uint32)}</li>
  *   <li>{@code tape[i * 2 + 1]}: {@code [63..35] fieldNumber (29-bit) | [34..32] wireType (3-bit)
- *       | [31..28] kind (4-bit) | [27..24] headerLen (4-bit) | [23..0] auxIndex (24-bit)}</li>
+ *       | [31..29] kind (3-bit) | [28..24] headerLen (5-bit) | [23..0] auxIndex (24-bit)}</li>
  * </ul>
  */
 public abstract class ImmutableWireBase {
@@ -160,14 +160,14 @@ public abstract class ImmutableWireBase {
         int totalLen = 0;
         for (int i = 0; i < segCount; i++) {
             int segIdx = segTapeIndices[i];
-            int headerLen = (int) ((parentTape[(segIdx << 1) + 1] >>> 24) & 0xFL);
+            int headerLen = (int) ((parentTape[(segIdx << 1) + 1] >>> 24) & 0x1FL);
             int valOff = (int) (parentTape[segIdx << 1] >>> 32) + headerLen;
             int recEnd = (int) parentTape[segIdx << 1];
             totalLen += (recEnd - valOff);
             scanRange(buffer, valOff, recEnd);
         }
         int firstSeg = segTapeIndices[0];
-        int firstHeader = (int) ((parentTape[(firstSeg << 1) + 1] >>> 24) & 0xFL);
+        int firstHeader = (int) ((parentTape[(firstSeg << 1) + 1] >>> 24) & 0x1FL);
         this.rawOffset = (int) (parentTape[firstSeg << 1] >>> 32) + firstHeader;
         this.rawLength = totalLen;
         this.scanned = true;
@@ -354,8 +354,8 @@ public abstract class ImmutableWireBase {
         long word0 = ((long) tagOffset << 32) | (recordEnd & 0xFFFFFFFFL);
         long word1 = ((long) fieldNumber << 35)
                 | ((long) (wireType & 0x7) << 32)
-                | ((long) KIND_UNKNOWN << 28)
-                | ((long) (headerLen & 0xF) << 24)
+                | ((long) KIND_UNKNOWN << 29)
+                | ((long) (headerLen & 0x1F) << 24)
                 | NO_AUX_IDX;
         this.tape[wordIdx] = word0;
         this.tape[wordIdx + 1] = word1;
@@ -371,31 +371,31 @@ public abstract class ImmutableWireBase {
     public final int tapeTagOffset(int tapeIdx) { return (int) (tape[tapeIdx << 1] >>> 32); }
     public final int tapeRecordEnd(int tapeIdx) { return (int) tape[tapeIdx << 1]; }
     public final int tapeRecordLength(int tapeIdx) { long w0 = tape[tapeIdx << 1]; return (int) w0 - (int) (w0 >>> 32); }
-    public final int tapeHeaderLength(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 24) & 0xFL); }
+    public final int tapeHeaderLength(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 24) & 0x1FL); }
     public final int tapeValueOffset(int tapeIdx) {
         long w0 = tape[tapeIdx << 1];
         long w1 = tape[(tapeIdx << 1) + 1];
-        return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL);
+        return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL);
     }
     public final int tapeValueLength(int tapeIdx) {
         long w0 = tape[tapeIdx << 1];
         long w1 = tape[(tapeIdx << 1) + 1];
-        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0xFL));
+        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL));
     }
     public final int tapeFieldNumber(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] >>> 35); }
     public final int tapeWireType(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 32) & 0x7L); }
-    public final int tapeKind(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 28) & 0xFL); }
+    public final int tapeKind(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 29) & 0x7L); }
     public final int tapeAuxIndex(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] & 0xFFFFFFL); }
 
     protected final void setTapeKindAndAux(int tapeIdx, int kind, int auxIndex) {
         int w1Idx = (tapeIdx << 1) + 1;
-        tape[w1Idx] = (tape[w1Idx] & ~((0xFL << 28) | 0xFFFFFFL))
-                | ((long) (kind & 0xF) << 28)
+        tape[w1Idx] = (tape[w1Idx] & ~((0x7L << 29) | 0xFFFFFFL))
+                | ((long) (kind & 0x7) << 29)
                 | (auxIndex & 0xFFFFFFL);
     }
 
     protected final void setTapeKind(int tapeIdx, int kind) {
         int w1Idx = (tapeIdx << 1) + 1;
-        tape[w1Idx] = (tape[w1Idx] & ~(0xFL << 28)) | ((long) (kind & 0xF) << 28);
+        tape[w1Idx] = (tape[w1Idx] & ~(0x7L << 29)) | ((long) (kind & 0x7) << 29);
     }
 }
