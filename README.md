@@ -6,52 +6,45 @@
 
 ## 核心特性
 
-1. **三级延迟反序列化（参考 `json-iterator`）**
-   - **Tier 0 (`wrap`)**：$O(1)$ 绑定原始字节切片，零扫描、零堆分配。
-   - **Tier 1 (`ShallowScanner`)**：首次访问某层字段时，利用 64-bit SWAR (`TZCNT`) 无分支跳过 Varint，利用 WireType 2 长度前缀以 $O(1)$ 跨过所有未访问的子消息、字符串与列表，将字段边界 `[tagOffset, valueOffset, recordEnd)` 记录于紧凑的 16-Byte `FieldTape` 中。
-   - **Tier 2（按需物化与位图缓存）**：仅解码被访问的字段；已读但未修改的字段（如长字符串、大子消息）在序列化时**直接拷贝原输入字节切片**，绝不二次编码。
-2. **四级输入复用序列化引擎**
-   - **Fast-Path 0（未修改直通）**：单次 `memcpy` / `System.arraycopy` 或零拷贝 `ByteString` 切片直出。
-   - **Fast-Path 1（跨层级同长原地修补 In-Place Patching）**：修改 `fixed32/64`、`double/float` 或编码后字节长度未变的 `varint`/`string` 时，无需重算任何外层父消息长度，直接在目标偏移处 $O(1)$ 覆写字节。
-   - **Fast-Path 2（连续原始区间合并拼接 Contiguous Span Coalescing）**：变长修改或删除字段时，自动将所有相邻未修改字段（连同原始 Tag、Length Varint 及未知字段 Unknown Fields）合并为连续区间整块复制，仅重编码脏字段。
-   - **Fast-Path 3（C++20 单遍投机长度回填）**：单遍写出脏子消息并原地回填长度前缀，省去 `ByteSizeLong()` 第一遍尺寸遍历。
-3. **双语言实现**
-   - **Java 21 接口兼容版**（`src/`）：同时实现官方 `com.google.protobuf.Message`、`Message.Builder` 与 `XxxOrBuilder` 接口，支持 `toBuilder().setXxx().build()` 零分配合一视图；对破坏 Lazy 的方法（`equals`、`hashCode`、反射 `Descriptor`、`UnknownFieldSet`）直接抛出 `UnsupportedOperationException`。同时提供类 `jsoniter.Any` 的动态无 Schema API [`ProtoDocument`](src/main/java/io/lazyproto/dynamic/ProtoDocument.java)。
-   - **C++20 硬件极限标杆版**（`cpp/`）：无兼容性包袱，采用栈内联 `TapeEntry` + 值内联子结构体 + `std::string_view` + 单遍投机回填，全场景 **0 Bytes/op 堆内存分配**。
+1. **Architecture v3（Java 21）+ C++20 零开销引擎**
+   - **Immutable Base + 外挂 COW Overlay + `WireMergeEngine`**：原始输入保持绝对不可变；`build()` 快照零深拷贝、多线程并发只读懒加载安全；`Builder.reuse()` 支持线程局部 `0 B/op` 复用。
+   - **64-bit SWAR Varint 跳过 + `FieldTape`**：利用 WireType 2 (`LEN`) 长度前缀以 $O(1)$ 跨过所有未访问子消息、字符串与 `repeated` 列表。
+   - **四级输入复用序列化**：Fast-Path 0 未改直通、Fast-Path 1 跨层级同长原地打补丁、Fast-Path 2 连续未改区间合并拼接、Fast-Path 3（C++20）单遍投机长度回填。
+2. **双语言实现与无 Schema 动态文档**
+   - **Java 21 接口兼容版**（[`src/main/java/io/lazyproto`](src/main/java/io/lazyproto)）：兼容 `Message` / `Message.Builder` / `XxxOrBuilder` 契约，并提供动态无 Schema 文档 [`ProtoDocument`](src/main/java/io/lazyproto/dynamic/ProtoDocument.java)。
+   - **C++20 极限标杆版**（[`cpp/lazy_proto.hpp`](cpp/lazy_proto.hpp)）：栈内联 `TapeEntry` + 值内联子结构体 + `std::string_view` + 单遍投机长度回填，全场景 **0 B/op** 堆内存分配。
 
 ---
 
-## 实测性能概览（12.4 KB 复杂嵌套消息 / 100 子项，AMD Ryzen 7 7840HS）
+## 实测性能概览（同输出 Buffer 复用口径，AMD Ryzen 7 7840HS）
 
-| 场景类别 | 场景描述 | Java 官方 PB | **Java `lazy-proto`** | C++ 标准 PB | **C++20 `lazy-proto`** |
+基于统一 [proto/order_envelope.proto](proto/order_envelope.proto) 生成真实官方类对比（Java：`protoc 3.25.5` + `protobuf-java 3.25.5` @ JDK 21；C++：`libprotobuf 3.21.12` + `GCC 15.2.0 -O3 -march=native -std=c++20`）：
+
+| 场景类别 | 场景描述 | Java 官方 PB ReuseB | **Java `lazy-proto` v3 ReuseB** | C++ 官方 `libprotobuf` Reuse | **C++20 `lazy-proto` Reuse** |
 | :--- | :--- | ---: | ---: | ---: | ---: |
-| **优势集 A1** | 只读 3 个字段 (Partial Read) | 8,643 ns | **1,384 ns (6.24x)** | 5,124 ns | **221 ns (23.16x)** |
-| **优势集 A2** | 读 2 字段后原样转发 (Fast-Path 0) | 18,888 ns | **828 ns (22.80x)** | 6,204 ns | **327 ns (18.99x)** |
-| **优势集 A3** | 改 3 个定长/同长字段 (`toBuilder()` 隔离) | 19,260 ns | **1,577 ns (12.21x)** | 6,237 ns | **314 ns (19.87x)** |
-| **优势集 A3-Zero** | 改 3 个定长/同长字段 (`toInPlaceBuilder()`) | 18,861 ns | **699 ns (27.00x)** | 6,237 ns | **314 ns (19.87x)** |
-| **优势集 A4** | 修改变长字符串与嵌套字段 (Fast-Path 2) | 18,957 ns | **1,895 ns (10.01x)** | 6,243 ns | **365 ns (17.10x)** |
-| **优势集 A5** | 100 项列表仅修改第 42 项 + 序列化 | 18,796 ns | **2,075 ns (9.06x)** | 6,267 ns | **363 ns (17.25x)** |
-| **优势集 A6** | 网关脱敏删除 1 个敏感字段 + 转发 | 18,798 ns | **853 ns (22.03x)** | 6,222 ns | **321 ns (19.41x)** |
-| **无优势集 B1** | 从零构建新消息 (0% 输入可复用) | 2,093 ns | **3,109 ns (0.67x)** | 256 ns | **453 ns (0.57x)** |
-| **无优势集 B2** | 100% 全树读取 (全部 513 个字段) | 7,047 ns | **12,999 ns (0.54x)** | 5,166 ns | **957 ns (5.40x)** |
-| **无优势集 B3** | 100% 全字段变长修改 + 重序列化 | 8,710 ns | **5,778 ns (1.51x)** | 1,612 ns | **959 ns (1.68x)** |
-| **无优势集 B4** | 11 字节极小消息全读 + 全变长修改 | 515 ns | **410 ns (1.26x)** | 25 ns | **23 ns (1.11x)** |
+| **优势 A1** | 只读 3 字段 (12.4 KB，无序列化) | 8,170 ns | **887 ns (9.21x, 0 B)** | 5,138 ns | **224 ns (22.98x, 0 B)** |
+| **优势 A2** | 读 2 字段后原样转发 (Fast-Path 0) | 18,313 ns | **694 ns (26.40x, 0 B)** | 8,370 ns | **298 ns (28.05x, 0 B)** |
+| **优势 A3** | 改 3 个定长/同长字段 (Fast-Path 1) | 18,320 ns | **1,018 ns (17.99x, 0 B)** | 8,490 ns | **318 ns (26.70x, 0 B)** |
+| **优势 A4** | 修改变长字符串与嵌套 City (Fast-Path 2) | 18,350 ns | **1,070 ns (17.15x, 80 B)** | 8,452 ns | **371 ns (22.81x, 0 B)** |
+| **优势 A5** | 100 项列表改第 42 项 + 序列化 | 19,392 ns | **2,025 ns (9.58x, 208 B)** | 8,473 ns | **358 ns (23.67x, 0 B)** |
+| **优势 A6** | 网关脱敏删除 1 个字段 + 转发 | 18,474 ns | **1,214 ns (15.22x, 0 B)** | 9,800 ns | **343 ns (28.58x, 0 B)** |
+| **劣势 B1** | 从零构建新消息 (10 子项) | 1,323 ns | **1,351 ns (0.98x)** | 710 ns | **431 ns (1.65x, 0 B)** |
+| **劣势 B2** | 100% 全树读取 (100 子项) | 6,860 ns | **12,268 ns (0.56x)** | 5,233 ns | **1,101 ns (4.75x, 0 B)** |
+| **劣势 B3** | 100% 全树变长修改 (20 子项) | 3,989 ns | **9,854 ns (0.40x)** | 2,411 ns | **969 ns (2.49x, 0 B)** |
+| **边界 B4** | 11 字节极小包全读 + 全变长修改 | 221 ns | **216 ns (1.02x, 0 B)** | 40.6 ns | **24.7 ns (1.64x, 0 B)** |
+
+> 完整含 Track I（每次分配 `toByteArray()` / `SerializeToString()`）、手写 Eager 基线及 JDK/GCC/Protobuf 版本说明的数据见 [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) 与 [DESIGN.md](DESIGN.md)。
 
 ---
 
-## 文档与运行指南
+## 运行指南
 
-- **详细架构设计文档**：[DESIGN.md](DESIGN.md)
-- **完整技术与基准评测报告**：[TECHNICAL_REPORT.md](TECHNICAL_REPORT.md)
-
-### 运行 Java 21 正确性测试与基准测试
+### Java 21 正确性与基准测试（自动使用 `protoc 3.25.5` 生成官方基线）
 ```bash
 mvn test
 ```
 
-### 运行 C++20 标杆正确性测试与基准测试
+### C++20 正确性与基准测试（需 `protobuf-compiler` 与 `libprotobuf-dev`）
 ```bash
-cd cpp
-g++ -O3 -march=native -std=c++20 -Wall -Wextra benchmark_main.cpp -o benchmark_cpp
-./benchmark_cpp
+make -C cpp run
 ```

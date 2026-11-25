@@ -6,8 +6,9 @@ target/
 *.ear
 *.log
 
-# C++ compiled binaries & objects
+# C++ compiled binaries & generated proto sources
 cpp/benchmark_cpp
+cpp/gen/
 *.o
 *.out
 *.exe

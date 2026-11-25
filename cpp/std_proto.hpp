@@ -11,10 +11,10 @@ namespace stdproto {
 using namespace lazyproto;
 
 /**
- * Standard C++ Eager Protobuf Object Model (matching standard protoc C++ generated classes):
- * - Eager recursive full-tree deserialization into std::string and std::vector<StdLineItem>
- * - Retains unknown fields in an UnknownField buffer
- * - Two-pass serialization: ByteSizeLong() (recursive size calculation) + SerializeToArray()
+ * Hand-Written Eager C++ Baseline (stdproto::StdOrderEnvelope):
+ * - Custom simplified eager object tree deserializing into std::string and std::vector<StdLineItem>
+ * - Uses repo wire utilities (lazyproto::read_varint32_cursor / WireWriter), NOT official libprotobuf
+ * - Kept alongside official protoc-generated libprotobuf classes solely as an internal hand-written eager reference.
  */
 
 struct UnknownRecord {

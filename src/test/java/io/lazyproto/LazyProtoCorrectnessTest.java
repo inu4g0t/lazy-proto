@@ -692,4 +692,36 @@ public class LazyProtoCorrectnessTest {
         assertEquals(111L, docOut.getUser().getUserId());
         assertEquals(7, docOut.getUser().getVipLevel());
     }
+
+    @Test
+    @DisplayName("E1: Official protoc-generated Message binary equivalence (parse, mutate, splice, unknown fields)")
+    void testE1_OfficialProtocGeneratedEquivalence() throws IOException {
+        byte[] complex = createComplexOrderBytes(100, 4096);
+        io.lazyproto.bench.proto.OrderEnvelope officialOrig =
+                io.lazyproto.bench.proto.OrderEnvelope.parseFrom(complex);
+        assertEquals(100, officialOrig.getItemsCount());
+        assertTrue(officialOrig.getUnknownFields().hasField(50));
+        assertTrue(officialOrig.getUnknownFields().hasField(51));
+
+        // Mutate same way on official protoc builder and lazy builder
+        io.lazyproto.bench.proto.OrderEnvelope.Builder ob = officialOrig.toBuilder()
+                .setBuyerName("protoc_cross_check_buyer")
+                .setStatus(50000);
+        ob.getUserBuilder().setCity("BEIJING");
+        ob.getItemsBuilder(42).setQuantity(999).setDescription("PROTOC_VERIFIED");
+        ob.clearAuthToken();
+        io.lazyproto.bench.proto.OrderEnvelope offMutated = ob.build();
+
+        LazyOrderEnvelope.Builder lb = LazyOrderEnvelope.parseFrom(complex).toBuilder()
+                .setBuyerName("protoc_cross_check_buyer")
+                .setStatus(50000);
+        lb.getUserBuilder().setCity("BEIJING");
+        lb.getItemsBuilder(42).setQuantity(999).setDescription("PROTOC_VERIFIED");
+        lb.clearAuthToken();
+        byte[] lazyWire = lb.build().toByteArray();
+
+        io.lazyproto.bench.proto.OrderEnvelope offFromLazy =
+                io.lazyproto.bench.proto.OrderEnvelope.parseFrom(lazyWire);
+        assertEquals(offMutated, offFromLazy);
+    }
 }

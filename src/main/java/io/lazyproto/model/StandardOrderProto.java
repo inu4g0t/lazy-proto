@@ -23,10 +23,12 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Standard Google Protobuf (Eager Deserialization + Immutable Message/Builder + Two-Pass Full Serialization +
+ * Hand-Written Eager Java Baseline (Eager Deserialization + Immutable Message/Builder + Two-Pass Full Serialization +
  * UnknownFieldSet + Full equals/hashCode) implementation of OrderEnvelope, UserProfile, and LineItem.
  *
- * <p>Follows the exact wire parsing, object allocation, and serialization lifecycle produced by standard {@code protoc}.
+ * <p>Uses {@code protobuf-java}'s {@link CodedInputStream}, {@link CodedOutputStream}, and {@link UnknownFieldSet}
+ * on top of a lightweight custom POJO tree rather than {@code protoc}-generated {@code GeneratedMessageV3} classes.
+ * Retained alongside real {@code protoc}-generated baseline classes in benchmark suites as a Hand-Written Eager reference.
  */
 public final class StandardOrderProto {
     private StandardOrderProto() {}

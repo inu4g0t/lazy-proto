@@ -1,6 +1,6 @@
-# Lazy-Proto 技术总结报告：Lazy 反序列化与输入复用序列化的架构、跨语言实现及硬件极限评测
+# Lazy-Proto 技术总结报告：Lazy 反序列化与输入复用序列化的架构、跨语言实现及真实官方基线对比
 
-> **报告概述**：本报告系统总结了 `lazy-proto` 的全局架构设计、核心算法创新，并对比了两种极具代表性的工程实现——**兼容官方 `com.google.protobuf` 接口的 Java 21 实现** 与 **抛弃一切兼容性包袱、追求物理硬件极限的 C++20 标杆实现**。通过在完全相同的 **优势测试集 (A1–A6)** 与 **无优势/劣势测试集 (B1–B4)** 上进行交叉正确性验证与微基准测试，量化揭示了算法架构与语言运行时（JVM vs Native C++20）对高性能序列化系统的真实影响。
+> **报告概述**：本报告基于统一 Schema [proto/order_envelope.proto](/home/inu4g0t/t3work/lazy-proto/proto/order_envelope.proto)，对 `lazy-proto`（Java 21 Architecture v3 接口兼容版 + C++20 硬件极限版）与 **真实官方 `protoc` 生成消息类**（`protoc 3.25.5` Java / `libprotobuf 3.21.12` C++）及 **手写精简 Eager 基线** 进行了同生命周期、同输出缓冲口径的交叉正确性验证与微基准评测。
 
 ---
 
@@ -8,154 +8,100 @@
 
 传统 Protocol Buffers 运行时（无论是 Java 还是 C++）均遵循 **“全量反序列化 $\to$ 内存对象树修改 $\to$ 两阶段全量重序列化”** 的对称流水线。在微服务网关、RPC 路由、流式特征处理等 **“读少写少、大进大出”（Read-Few, Modify-Few, Passthrough-Most）** 场景中，90% 以上的 CPU 周期与内存带宽被浪费在从未被业务触碰的字段上。
 
-`lazy-proto` 参考 `json-iterator` (`jsoniter`) 的延迟按需解析思想，针对 Protobuf 二进制 Wire Format 的自描述特性提出了四大核心机制：
-
-### 1.1 四级核心机制
-
-1. **Tier-0 $O(1)$ 零开销切片绑定 (`wrap`)**：
-   - 接收字节数组时仅记录 `(buf, rawOffset, rawLength)`，不扫描、不分配对象。
-2. **Tier-1 单层非递归浅扫描（`ShallowScanner` + 64-bit SWAR Varint 跳过）**：
-   - 首次读取某层字段时，仅线性扫描当前层 Tag，将每个 Wire Record 的物理边界 `[tagOffset, valueOffset, recordEnd)` 记入紧凑的 16-Byte `FieldTape`。
-   - **SWAR 指令级加速**：使用 64-bit 非对齐读取 + `~word & 0x8080808080808080ULL` + 硬件 `TZCNT`（Count Trailing Zeros）指令，在 1~2 个时钟周期内无分支算出 Varint 字节长度并跳过。
-   - **$O(1)$ 跨越复杂结构**：利用 WireType 2 (`LEN`) 的长度前缀直接执行 `cursor += len`，**绝不递归进入未访问的子消息，绝不解码未访问的 UTF-8 字符串与列表元素**。
-3. **Tier-2 按需物化与“已读未改不回写”状态机**：
-   - 通过 `presentMask`、`decodedMask`、`sameSizeDirtyMask`、`varSizeDirtyMask` 四组位图管理字段生命周期。
-   - **关键状态分离**：即使某个长字符串或子消息已被读取解码（`decodedMask = 1`），只要未调用 Setter 修改（`dirtyMask = 0`），其状态仍为 `CLEAN_RAW`，在序列化时**直接拷贝原输入中的原始字节切片**，省去二次 UTF-8 编码与 Varint 重编码。
-4. **Tier-3 四级输入复用序列化引擎（Input-Reusing Serialization）**：
-   - **Fast-Path 0（未修改直通）**：整棵消息或子树未发生修改时，$O(1)$ 返回 `rawLength`，单次 `memcpy` / `System.arraycopy` 输出原始切片。
-   - **Fast-Path 1（跨层级同长原地修补 In-Place Patching）**：当修改的字段为定长类型（`fixed32/64`、`float/double`、`bool`）或新旧编码字节长度恰好相等的 `varint`/`string` 时，外层所有父消息的 Length Varint 均无需改变，整块拷贝原数组后直接在目标 `valueOffset` 处覆写新字节，序列化退化为 $O(1)$。
-   - **Fast-Path 2（连续原始区间合并拼接 Contiguous Span Coalescing）**：当发生变长修改或字段删除时，扫描 `FieldTape` 将所有物理相邻的 `CLEAN_RAW` 字段（连同其原始 Tag、Length Varint 及中间夹杂的 Unknown Fields）自动向右吞并为一个连续区间 `[spanStart, spanEnd)`，一次性批量 `memcpy`，**仅对极少数 Dirty 字段执行重新编码**。
-   - **Fast-Path 3（C++ 单遍投机长度回填 Single-Pass Speculative Backpatching）**：在 C++ 标杆版中，写出脏子消息时预先投机保留 1 字节长度槽位，单遍直接拼接子消息体并在写完后原地回填实际长度，彻底消灭了传统 Protobuf 的 `ByteSizeLong()` 第一遍遍历。
+`lazy-proto` 提出四级机制（Java Architecture v3 采用 `ImmutableWireBase` + 外挂 COW `WireOverlay` + `WireMergeEngine`）：
+1. **Tier-0 $O(1)$ 零开销切片绑定**：记录 `(buf, rawOffset, rawLength)`，不扫描、不分配对象。
+2. **Tier-1 单层非递归浅扫描（`ShallowScanner` + 64-bit SWAR Varint 跳过）**：利用 WireType 2 (`LEN`) 长度前缀以 $O(1)$ 跨越未访问的子消息、字符串与 `repeated` 列表，将物理边界记入紧凑 `FieldTape`。
+3. **Tier-2 外挂增量 Overlay 与“已读未改不回写”状态分离**：所有读写隔离在外挂 `Overlay` 中，仅解码被读取的字段，且冻结构建后的快照 100% 不可变共享（多线程并发懒加载安全）。
+4. **Tier-3 四级输入复用序列化引擎**：Fast-Path 0 未改直通、Fast-Path 1 跨层级同长原地打补丁、Fast-Path 2 连续原始区间合并拼接、Fast-Path 3 C++ 单遍投机长度回填。
 
 ---
 
-## 2. 两种实现形态的架构对比：Java 接口兼容版 vs C++20 极限标杆版
+## 2. 实验环境、版本与严格对等对比口径
 
-为了探究“接口兼容性约束”与“语言运行时开销”的真实边界，我们在同一代码库中实现了两个版本：
+### 2.1 软硬件与工具链版本
+- **CPU**：AMD Ryzen 7 7840HS (Zen 4 架构，L1d 256KB / L2 8MB / L3 16MB)
+- **操作系统**：Ubuntu 26.04 LTS (Linux x86_64)
+- **Java 21 官方基线与编译器**：
+  - JDK：`Eclipse Temurin OpenJDK 21.0.13.1-LTS`
+  - 官方生成与运行时：`com.google.protobuf:protoc:3.25.5` + `protobuf-java 3.25.5`（经 `mvn test-compile` 由 [order_envelope.proto](/home/inu4g0t/t3work/lazy-proto/proto/order_envelope.proto) 生成 `io.lazyproto.bench.proto.OrderEnvelope`）
+  - 手写 Eager 基线：[StandardOrderProto.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/model/StandardOrderProto.java)（仅使用底层 `CodedInputStream`/`CodedOutputStream` 的简化 POJO 树，与真实 `protoc` 类严格区分）
+- **C++20 官方基线与编译参数**：
+  - 编译器与参数：`GCC 15.2.0` (`g++ -O3 -march=native -std=c++20 -Wall -Wextra -lprotobuf`)
+  - 官方生成与链接库：`libprotoc 3.21.12` + `libprotobuf-dev 3.21.12-15ubuntu1.1`（动态链接系统 `-lprotobuf`）
+  - 手写 Eager 基线：[std_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/std_proto.hpp)
 
-| 架构维度 | **Java 21 接口兼容版** ([LazyOrderProto.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/model/LazyOrderProto.java)) | **C++20 性能极限标杆版** ([lazy_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/lazy_proto.hpp)) |
-| :--- | :--- | :--- |
-| **设计约束** | **兼容官方 `com.google.protobuf.Message`、`Message.Builder` 与 `XxxOrBuilder` 接口**；不支持的方法（`equals`、`hashCode`、反射 `Descriptor`、`UnknownFieldSet`）直接抛 `UnsupportedOperationException` | **零兼容性包袱**；无虚函数表（`0 vtable`），纯 C++20 值语义内联结构体，追求当前硬件物理极限 |
-| **`FieldTape` 内存布局** | 为规避 JVM 每对象 12~16B 对象头，使用 `long[] tape` 位打包（每条目 2 个 `long`，读取时需做位移动与掩码解包） | 16 字节对齐原生结构体 `struct alignas(16) TapeEntry { uint32_t tag_off, record_end, val_off; uint16_t field_num; uint8_t wt, flags; }`，**直接内联在栈/宿主结构体中（`TapeEntry tape_[160]`），0 位移运算、0 堆分配** |
-| **嵌套子消息与列表布局** | 预挂载子视图对象引用 + `LazyProtobufList<E>`（`AbstractList` 包装静态单链表 `nextTapeIdx`） | 子消息 `LazyUserProfile user_` 与 `LazyLineItem items_pool_[128]` **按值直接内联在父结构体连续内存中**，浅扫描直接填充 `uint16_t item_tape_idx_[128]`，**0 指针跳转** |
-| **字符串 (`string`) 表示** | 官方接口强制要求返回 `java.lang.String`（触发 UTF-8 $\to$ Latin1/UTF-16 堆分配与拷贝）；额外提供 `Utf8Slice` 与 `UnsafeByteOperations` 零拷贝 `ByteString` | 直接返回 **`std::string_view`（16 字节 `ptr + len` 寄存器返回）**；无论读多少个字符串、修改多少个字符串引用，**100% 零拷贝、零堆分配、零转码** |
-| **脏子消息序列化遍数** | **2-Pass**（为兼容 `Message.getSerializedSize()`，脏路径需先增量计算尺寸再写出） | **1-Pass**（`write_submessage_single_pass` 投机预留 1 字节长度位，写完子消息后原地回填长度，完全省去尺寸计算遍历） |
+### 2.2 对比口径分离原则（消除输出缓冲与生命周期不对称偏差）
+- **Java Track I（同不可变生命周期 + 每次分配 `toByteArray()`）**：官方 PB / 手写 Eager / Lazy Imm 均走 `parseFrom -> toBuilder -> build -> toByteArray()`。
+- **Java Track II（统一复用预分配输出缓冲 `reusableOutBuf`）**：
+  - `OffImm` vs `LazyImm`：相同不可变快照生命周期 + `CodedOutputStream(outBuf)` vs `writeToBuffer(outBuf)`；
+  - `OffRseB` vs `LazyRseB`：相同线程局部可复用 `Builder`（官方 `clear().mergeFrom(bytes)` vs `lazy.reuse(bytes)`）+ `reusableOutBuf`。
+- **C++ 双口径对比**：
+  - **Fresh+Alloc**：每轮新建对象 + 分配输出 `std::string`；
+  - **Reuse+ReuseOutBuf**：复用已分配消息对象（官方 `ParseFromArray`/`Clear()` + `SerializeToArray(out_buf)`）vs `LazyOrderEnvelope`（栈结构 `wrap()` + `write_to_buffer(out_buf)`）。
 
----
-
-## 3. 实验环境与基准测试集设计
-
-### 3.1 软硬件环境
-- **CPU**：AMD Ryzen 7 7840HS (Zen 4 架构，16 线程，支持硬件 BMI1/BMI2 `TZCNT`、AVX2、AVX-512，L1d 256KB / L2 8MB / L3 16MB)
-- **操作系统**：Ubuntu 26.04 LTS (Linux Kernel 7.0.0-27-generic x86_64)
-- **Java 环境**：Eclipse Temurin OpenJDK 21.0.13.1-LTS (`-XX:+UseG1GC`)
-- **C++ 环境**：GCC 15.2.0 (`g++ -O3 -march=native -std=c++20`)
-
-### 3.2 负载数据包与十大测试集（A1–A6 优势集 + B1–B4 劣势集）
-
-主测试数据包为 **12.4 KB（12,435 字节）** 的复杂嵌套 `OrderEnvelope` 消息，包含：
-- 8 个顶层标量/字符串字段 + **4,096 字节二进制 `payload`**；
-- 1 个嵌套 `UserProfile` 子消息（5 个字段）；
-- **100 个 `LineItem` 重复子消息列表**（共 500 个子字段）；
-- 2 个未知扩展字段（`#50` varint 与 `#51` string，用于验证透明路由时的未知字段无损保留）。
-
-所有 10 个场景在 Java 与 C++ 下均先通过 100% 二进制等价正确性校验（[LazyProtoCorrectnessTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoCorrectnessTest.java) 与 [benchmark_main.cpp](/home/inu4g0t/t3work/lazy-proto/cpp/benchmark_main.cpp)）。
+主测试包：12.4 KB 复杂嵌套 `OrderEnvelope`（100 个 `LineItem` + 4 KB `payload` + 2 个未知字段 `#50, #51`）；B3 为 20 个 `LineItem`；B4 为 11 字节 3 整数极小包。
 
 ---
 
-## 4. 全景性能与内存分配评测数据
+## 3. Java 21 实测基准数据（Track I & Track II）
 
-### 4.1 四方横向对比总表（耗时 `ns/op` 与加速比）
+### 3.1 Java Track I：同不可变生命周期 + `toByteArray()`
 
-> **Java 模式口径说明**：基于 **Architecture v3（不可变 `ImmutableWireBase` 底座 + 外挂 COW `WireOverlay`）**。`A3` 使用标准不可变流 `parseFrom().toBuilder()...build()`（含每次重新扫描 `OrderBase` 的成本，而真实业务中若 `msg` 预先已解析则 `toBuilder()` 零 `tape[]` 拷贝）；`A3-Zero` 及 `A1`、`A2`、`A4`–`A6`、`B2`–`B4` 使用线程局部可复用 `Builder.reuse(bytes)` 在 `0 B` 固定底座复用模式下测量解析与融合引擎本身开销（仍保持 100% 原始输入不可变与快照安全边界）。
+| 场景编号 | 工作负载描述 | 官方 `protoc` PB (`ns/op`) | 手写 Eager (`ns/op`) | **`lazy-proto` Imm (`ns/op`)** | `vs 官方 PB` | 官方 PB 堆分配 | **`lazy-proto` 堆分配** |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **A1** | 只读 3 个字段 (12.4 KB，无序列化) | 8,649.8 | 8,072.4 | **1,981.4** | **4.37x** | 34,960 B | **3,595 B** |
+| **A2** | 读 2 字段 + 原样转发 (FP0) | 19,895.9 | 18,883.6 | **1,565.2** | **12.71x** | 50,936 B | **15,760 B** |
+| **A3** | 改 3 个定长/同长字段 (FP1) | 19,162.5 | 18,569.1 | **2,480.4** | **7.73x** | 51,312 B | **16,552 B** |
+| **A4** | 改变长字符串与嵌套 City (FP2) | 19,029.5 | 19,534.7 | **3,242.7** | **5.87x** | 51,344 B | **16,659 B** |
+| **A5** | 100 项列表改第 42 项 | 19,858.9 | 18,108.3 | **3,190.5** | **6.22x** | 52,640 B | **17,061 B** |
+| **A6** | 脱敏删 1 个字段 + 转发 | 21,737.5 | 18,298.6 | **2,208.8** | **9.84x** | 51,088 B | **16,133 B** |
+| **B1** | 从零构建新消息 (10 子项) | 2,177.2 | 1,690.0 | **2,820.2** | **0.77x** | 3,728 B | **6,528 B** |
+| **B2** | **100% 全树读取** (100 子项) | 5,990.3 | 5,302.3 | **14,236.1** | **0.42x** | 34,960 B | **51,648 B** |
+| **B3** | **100% 全树变长修改** (20 子项) | 8,453.9 | 6,985.2 | **13,822.9** | **0.61x** | 15,880 B | **15,808 B** |
+| **B4** | 11 字节极小包全读+全变长改 | 554.1 | 251.6 | **472.7** | **1.17x** | 536 B | **2,816 B** |
 
-| 场景类别 | 场景编号与工作负载描述 | Java 官方 PB (`ns/op`) | **Java `lazy-proto` v3 (`ns/op`)** | Java 加速比 | C++ 标准 PB (`ns/op`) | **C++20 `lazy-proto` 标杆 (`ns/op`)** | **C++ 加速比** | **C++ 标杆相比 Java 官方加速比** |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **优势集 A1** | 只读 3 个字段 (`orderId`, `status`, `user.vipLevel`) | 11,068.4 | **1,028.9** | **10.76x** | 5,124.2 | **221.2** | **23.16x** | **🔥 50.04x** |
-| **优势集 A2** | 读 2 个字段后未修改原样转发 (**Fast-Path 0**) | 18,808.7 | **843.3** | **22.30x** | 6,203.8 | **326.7** | **18.99x** | **🔥 57.57x** |
-| **优势集 A3** | 修改 3 个定长/同长字段 (`parseFrom + toBuilder()` 融合，**Path 1**) | 19,031.0 | **1,544.4** | **12.32x** | 6,237.4 | **314.0** | **19.87x** | **🔥 60.61x** |
-| **优势集 A3-Zero** | 修改 3 个定长/同长字段 (`Builder.reuse()` 复用外挂，**Path 1**) | 18,785.3 | **746.0** | **25.18x** | 6,237.4 | **314.0** | **19.87x** | **🔥 59.83x** |
-| **优势集 A4** | 修改变长字符串与嵌套子消息字段 + 拼接 (**Fast-Path 2**) | 18,983.9 | **2,326.8** | **8.16x** | 6,243.4 | **365.0** | **17.10x** | **🔥 52.01x** |
-| **优势集 A5** | 100 项 `repeated` 列表仅修改第 42 项 + 序列化 | 18,785.2 | **1,606.1** | **11.70x** | 6,267.2 | **363.3** | **17.25x** | **🔥 51.71x** |
-| **优势集 A6** | 网关脱敏删除 1 个敏感字段 (`clearAuthToken`) + 转发 | 18,771.1 | **1,152.1** | **16.29x** | 6,221.6 | **320.6** | **19.41x** | **🔥 58.55x** |
-| **无优势集 B1** | 从零构建全新消息 (10 子项，0% 输入可复用) + 序列化 | 2,110.3 | **2,884.5** | **0.73x** | 256.3 | **453.4** | **0.57x** | **4.65x** |
-| **无优势集 B2** | **100% 全树读取**（读全部字段及 100 个子项所有 500 字段） | 7,327.9 | **16,028.6** | **0.46x** | 5,166.0 | **957.4** | **🚀 5.40x** | **🔥 7.65x** |
-| **无优势集 B3** | **100% 全字段变长修改** + 重序列化（0% 切片可复用） | 7,430.1 | **10,566.8** | **0.70x** | 1,611.8 | **958.7** | **1.68x** | **🔥 7.75x** |
-| **无优势集 B4** | **11 字节极小消息**（仅 3 个整数，全读 + 全变长修改） | 251.9 | **414.3** | **0.61x** | 25.1 | **22.7** | **1.11x** | **🔥 11.10x** |
+### 3.2 Java Track II：统一复用输出 Buffer（`outBuf`）+ Immutable / Reusable Builder
 
----
-
-### 4.2 每次操作堆内存分配对比表（Heap Allocations `Bytes/op`）
-
-| 场景编号 | 工作负载描述 | Java 官方 PB (`B/op`) | **Java `lazy-proto` v3 (`B/op`)** | C++ 标准 PB (`B/op`) | **C++20 `lazy-proto` (`B/op`)** |
-| :--- | :--- | ---: | ---: | ---: | ---: |
-| **A1** | 只读 3 个字段 (12.4 KB 消息) | 38,716 B | **0 B** | 34,373 B | **0 B** |
-| **A2** | 读 2 个字段 + 原样转发 (Fast-Path 0) | 54,760 B | **0 B** | 34,373 B | **0 B** |
-| **A3** | 修改 3 个定长/同长字段 (`parseFrom + toBuilder()`) | 57,248 B | **4,144 B** *(含每次完整重扫建 `OrderBase`)* | 34,373 B | **0 B** |
-| **A3-Zero** | 修改 3 个定长/同长字段 (`Builder.reuse()` 复用外挂) | 57,248 B | **0 B** | 34,373 B | **0 B** |
-| **A4** | 修改变长字符串与嵌套字段 + 拼接 (`Builder.reuse()` 复用) | 57,280 B | **80 B** *(仅新 String UTF-8 byte[])* | 34,373 B | **0 B** |
-| **A5** | 100 项列表仅修改第 42 项 + 序列化 (`Builder.reuse()` 复用) | 57,216 B | **185 B** *(仅单项 Overlay 与新 String)* | 34,373 B | **0 B** |
-| **A6** | 网关脱敏删除 1 个敏感字段 + 转发 (`Builder.reuse()` 复用) | 57,056 B | **0 B** | 34,373 B | **0 B** |
-| **B1** | 从零构建新消息 (10 子项) + 序列化 | 4,032 B | **5,840 B** | 1,248 B | **0 B** |
-| **B2** | 100% 全树读取 (全部标量、字符串及 100 子项) | 38,784 B | **19,535 B** *(含 205 个 String 对象)* | 34,373 B | **0 B** |
-| **B3** | 100% 全字段变长修改 + 重序列化 | 16,912 B | **6,176 B** | 8,413 B | **0 B** |
-| **B4** | 11 字节极小消息全读 + 全变长修改 | 760 B | **0 B** | 0 B *(SSO)* | **0 B** |
-
-> **注**：C++20 `lazy-proto` 在全部 10 个测试场景（含优势集与劣势集）中均实现了严格的 **`0 Bytes/op` 堆内存分配（Zero `malloc`/`new`）**！
+| 场景编号 | 工作负载描述 | 官方 Imm (`ns`) | 官方 ReuseB (`ns`) | 手写 Eager (`ns`) | **`lazy` Imm (`ns`)** | **`lazy` ReuseB (`ns`)** | `Imm` 加速比 | `ReuseB` 加速比 | 官方 ReuseB 分配 | **`lazy` ReuseB 分配** |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **A1** | 只读 3 字段 (无输出) | 8,649.8 | 8,169.9 | 8,072.4 | **1,981.4** | **887.2** | **4.37x** | **9.21x** | 34,312 B | **0 B** |
+| **A2** | 读 2 字段 + 转发 (FP0) | 18,396.7 | 18,313.2 | 17,173.3 | **863.1** | **693.6** | **21.32x** | **26.40x** | 38,424 B | **0 B** |
+| **A3** | 改 3 同长字段 (FP1) | 18,315.0 | 18,319.9 | 17,339.8 | **1,005.8** | **1,018.1** | **18.21x** | **17.99x** | 38,424 B | **0 B** |
+| **A4** | 改变长字符串 + City (FP2) | 18,381.1 | 18,349.8 | 17,405.2 | **1,381.4** | **1,069.9** | **13.31x** | **17.15x** | 38,424 B | **80 B** |
+| **A5** | 100 项列表改第 42 项 | 19,306.5 | 19,392.2 | 17,753.3 | **1,596.8** | **2,024.5** | **12.09x** | **9.58x** | 39,040 B | **208 B** |
+| **A6** | 脱敏删 1 字段 + 转发 | 18,291.3 | 18,474.0 | 17,260.5 | **1,231.7** | **1,213.7** | **14.85x** | **15.22x** | 38,424 B | **0 B** |
+| **B1** | 从零构建 (10 子项) | 1,322.9 | 1,322.9 | 1,006.3 | **1,350.6** | **1,350.6** | **0.98x** | **0.98x** | 2,344 B | **5,848 B** |
+| **B2** | **100% 全树读取** | 5,990.3 | 6,860.4 | 5,302.3 | **14,236.1** | **12,268.3** | **0.42x** | **0.56x** | 34,312 B | **19,552 B** |
+| **B3** | **100% 全树变长改** | 4,058.9 | 3,989.1 | 3,301.8 | **9,606.5** | **9,853.6** | **0.42x** | **0.40x** | 13,920 B | **6,176 B** |
+| **B4** | 11 字节全读+全变长改 | 380.8 | 221.0 | 268.4 | **311.9** | **215.7** | **1.22x** | **1.02x** | 224 B | **0 B** |
 
 ---
 
-## 5. 深度技术剖析：从评测数据看架构与语言的本质规律
+## 4. C++20 实测基准数据（官方 `libprotobuf 3.21.12` vs 手写 Eager vs Lazy-Proto C++20）
 
-### 5.1 为什么 C++20 标杆版在 12.4 KB 消息上的读写改序列化稳定在 `221 ~ 365 ns`？
-我们可以根据 Zen 4 处理器的物理极限来拆解这 **314 ns（A3）~ 365 ns（A4）**：
-1. **单层浅扫描开销（`ShallowScanner`）**：
-   - 顶层共有 ~110 个 Wire Tag（含 100 个 `LineItem` 的外层 Tag）。
-   - 每个 `LineItem` 为 WireType 2，读取 1 字节 Tag + 1 字节 Length + 执行 `cursor += len` 并写入 16-Byte 对齐的 `TapeEntry`，平均每个 Tag 仅耗费 **~1.8 ns（约 7~8 个 CPU 时钟周期）**，扫描整层 12.4 KB 仅需 **~200 ns**！
-2. **12.4 KB 内存块复制开销（`memcpy`）**：
-   - 在 Zen 4 的 L1/L2 Cache 中，AVX-512 加速的 `std::memcpy` 复制 12,435 字节耗时约 **~105 ns**（对应约 118 GB/s 有效内存带宽）。
-3. **结论**：
-   $$\text{理论硬件下限} = T_{\text{TagSkip}}(200\text{ ns}) + T_{\text{memcpy}}(105\text{ ns}) \approx 305\text{ ns}$$
-   我们的 C++20 `lazy-proto` 在 **A2（326.7 ns）**、**A3（314.0 ns）**、**A6（320.6 ns）**、**A5（363.3 ns）** 上的实测耗时，已经**逼近了 CPU L1/L2 缓存带宽与 Tag 跳跃的物理极限**！
+| 场景 | 工作负载描述 | 官方 PB Fresh (`ns`) | 官方 PB Reuse (`ns`) | 手写 Eager (`ns`) | **Lazy Alloc (`ns`)** | **Lazy Reuse (`ns`)** | `vs PB-Fresh` | `vs PB-Reuse` | PB-Reuse 分配 | **Lazy-Reuse 分配** |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **A1** | 只读 3 字段 (12.4 KB) | 13,388.4 | 5,137.5 | 5,272.0 | **223.5** | **223.5** | **59.89x** | **22.98x** | 214 B | **0 B** |
+| **A2** | 读 2 + 转发 (FP0) | 16,308.5 | 8,370.4 | 6,295.5 | **375.8** | **298.4** | **43.39x** | **28.05x** | 214 B | **0 B** |
+| **A3** | 3 同长/定长字段 (FP1) | 16,235.5 | 8,490.2 | 6,395.4 | **408.9** | **317.9** | **39.70x** | **26.70x** | 214 B | **0 B** |
+| **A4** | 变长字符串 + City (FP2) | 16,701.7 | 8,451.7 | 6,394.1 | **462.8** | **370.5** | **36.09x** | **22.81x** | 244 B | **0 B** |
+| **A5** | 100 项改第 42 项 | 16,230.3 | 8,473.2 | 6,349.0 | **446.3** | **358.0** | **36.37x** | **23.67x** | 235 B | **0 B** |
+| **A6** | 脱敏删 1 字段 + 转发 | 16,419.7 | 9,800.2 | 6,367.5 | **422.6** | **342.9** | **38.85x** | **28.58x** | 214 B | **0 B** |
+| **B1** | 从零构建 (10 子项) | 1,074.6 | 710.1 | 254.9 | **426.6** | **430.5** | **2.52x** | **1.65x** | 156 B | **0 B** |
+| **B2** | 100% 全树读取 (100 项) | 13,171.8 | 5,232.5 | 5,393.7 | **1,100.5** | **1,100.5** | **11.97x** | **4.75x** | 214 B | **0 B** |
+| **B3** | 100% 全树变长改 (20 项) | 4,593.5 | 2,410.7 | 1,723.7 | **1,016.7** | **968.5** | **4.52x** | **2.49x** | 889 B | **0 B** |
+| **B4** | 11 字节全读+全变长改 | 49.8 | 40.6 | 26.9 | **30.2** | **24.7** | **1.65x** | **1.64x** | 0 B | **0 B** |
 
-### 5.2 为什么 `B2（100% 全树读取）` 在 Java 下是劣势（`0.58x`），而在 C++20 下反而成了 `5.40x` 的巨大优势？
-这是本次对比实验中最具价值的发现之一：
-- **在 Java 版中（`7,531 ns -> 12,951 ns, 0.58x`）**：
-  1. 为了兼容官方 `OrderEnvelopeOrBuilder` 接口，`getSku()`、`getDescription()`、`getBuyerName()` 等方法必须返回 `java.lang.String`。当 100% 读取全部 100 个子项时，必须构造 **205 个 `java.lang.String` 对象（分配 15,552 字节堆内存并执行 205 次 UTF-8 字节拷贝与编码检查）**。
-  2. 此外，Java 版对 100 个 `LazyLineItem` 先做了一遍 `ShallowScanner` 构建 `long[] tape`（位打包），然后再逐字段做位掩码解包读取，付出了 2-Pass 开销。
-- **在 C++20 标杆版中（`5,166 ns -> 957.4 ns, 5.40x`）**：
-  1. 抛弃兼容性包袱后，所有字符串接口全部返回 **`std::string_view`**（仅将 `buf + val_off` 指针和 `val_len` 装入两个寄存器），省去了标准 C++ Protobuf 中 205 个 `std::string` 的堆内存分配（`34,373 Bytes -> 0 Bytes`）与拷贝！
-  2. 对于需要全量读取的叶子节点 `LazyLineItem`，C++ 版提供了 `read_item_eager()` 单遍寄存器直读路径，免去了叶子层构建 Tape 的二次开销，从而即便在 100% 全树读取场景下依然比标准 C++ Protobuf 快 **5.40 倍**！
-- **对 Java 版的优化启示**：
-  - 在 Java 中如果遇到需要遍历大列表全部字符串字段的场景，只要调用方使用我们扩展的零拷贝 **`getSkuSlice()` / `getDescriptionSlice()`（返回复用的 `Utf8Slice`）** 替代 `getSku()`（返回 `String`），即可同样省去那 15.5 KB 的 `String` 堆分配！
-
-### 5.3 Java 版与 C++20 版在变长拼接 `A4` 上的差距来源（`2,256 ns` vs `365 ns`）
-在 `A4`（修改顶层变长字符串 + 修改嵌套子消息变长字符串 + 拼接序列化）中，C++20 比 Java `lazy-proto` 快 **6.18 倍**，主要来自三项语言级差异：
-1. **单遍投机长度回填（1-Pass Speculative Backpatching）vs 两遍尺寸计算（2-Pass `getSerializedSize`）**：
-   - C++20 使用 `write_submessage_single_pass` 直接在输出流上预留 1 字节长度槽，写完子消息后原地回填 `*len_slot = child_len`，只遍历一次 `FieldTape`；
-   - Java 版为了支持 `com.google.protobuf.Message.getSerializedSize()` 契约并精确分配 `new byte[size]`，需要先递归计算脏子树尺寸再写出。
-2. **字符串写入时的 UTF-8 转换**：
-   - Java 的 `setCity("SHANGHAI_PUDONG")` 接收 `java.lang.String`，必须调用 `value.getBytes(UTF_8)` 在堆上分配新的 `byte[]`（产生 104B 分配）；
-   - C++20 的 `set_city("SHANGHAI_PUDONG")` 直接接收 `std::string_view` 字面量指针，零分配、零转码。
-3. **16-Byte 原生对齐 `struct TapeEntry` vs `long[]` 位移解包**：
-   - C++20 直接访问 `e.tag_offset`、`e.record_end`、`e.value_offset` 等 32-bit 结构体字段，无需任何移位和按位与指令。
-
-### 5.4 唯一真正不占优的场景：`B1（从零构建全新消息并序列化）`
-无论是 Java（`0.94x`）还是 C++（`0.57x`，`453 ns` vs `256 ns`）：
-- 当消息**完全是从零构建（`newBuilder()` / `init_scratch()`）**、根本没有任何原始输入 `byte[]` 可以跳过或复用时，`lazy-proto` 的状态位图维护（`presentMask`、`appendedMask`、`varSizeDirtyMask`）和 `TapeEntry` 分支检查属于纯额外开销。
-- **工程建议**：`lazy-proto` 的最佳适用定位是 **“有输入字节流的反序列化只读、局部修改转发、网关裁剪/打标、流式管道”**；对于纯数据生产端（从零拼装新消息且从不读取二进制输入），直接使用轻量流式 `WireWriter` 顺序写出即可。
+> 注：C++ `PB-Fresh` 在 A1–A6 上触发 `24 KB ~ 36 KB/op` 堆分配；`PB-Reuse` 虽复用了节点容器但仍因未知字段等分配 `214 ~ 889 B/op`；而 `Lazy-Reuse` 在 **全部 10 个场景中均为严格的 `0 B/op`（Zero `malloc`/`new`）**。
 
 ---
 
-## 6. 结论与工程落地指南
+## 5. 核心结论与客观定位
 
-1. **Java 生产落地结论**：
-   - 通过 **“不可变原始底座（`ImmutableWireBase`）+ 外挂 COW 写增量（`WireOverlay`）+ 兼容 `Message`/`Message.Builder`/`XxxOrBuilder` 契约，并对 `equals`/`hashCode`/反射方法直接抛出 `UnsupportedOperationException`”**，Java 版 v3 在彻底消除跨代快照与子 Builder 污染风险的同时，无缝兼容标准 Protobuf 调用习惯；
-   - 在占微服务/网关 90% 以上的 **优势场景集（A1–A6）** 中，Java 版 v3 相比官方 `protobuf-java` 取得了 **8.16x ~ 25.18x 的吞吐量提升**，并将热点复用路径的堆内存分配降至 **0 ~ 185 Bytes/op**。
-2. **C++20 性能天花板结论**：
-   - 抛弃兼容性包袱、采用 **栈内联 `TapeEntry` + 值内联子结构体 + `std::string_view` + 单遍投机长度回填** 的 C++20 实现，将 12.4 KB 复杂消息的读取、局部修改与再序列化压缩到了 **221 ns ~ 365 ns**（比官方 Java Protobuf 快 **40x ~ 64x**，比标准 C++ Protobuf 快 **17x ~ 23x**），且在全场景下实现了 **100% 零堆内存分配（0 Bytes/op）**。
-3. **仓库产出物索引**：
-   - 全局与跨语言架构设计文档：[DESIGN.md](/home/inu4g0t/t3work/lazy-proto/DESIGN.md)
-   - 本技术评测报告：[TECHNICAL_REPORT.md](/home/inu4g0t/t3work/lazy-proto/TECHNICAL_REPORT.md)
-   - Java 21 核心实现与基准测试：[pom.xml](/home/inu4g0t/t3work/lazy-proto/pom.xml)、[AbstractLazyMessage.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/runtime/AbstractLazyMessage.java)、[LazyOrderProto.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/model/LazyOrderProto.java)、[LazyProtoCorrectnessTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoCorrectnessTest.java)、[LazyProtoBenchmarkSuite.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoBenchmarkSuite.java)
-   - C++20 极限性能实现与基准测试：[lazy_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/lazy_proto.hpp)、[std_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/std_proto.hpp)、[benchmark_main.cpp](/home/inu4g0t/t3work/lazy-proto/cpp/benchmark_main.cpp)
+1. **为什么之前必须做真实 `protoc` + 同口径对比？**
+   - Java 中，先前拿官方类 `toByteArray()` 对抗 `lazy.writeToBuffer()` 放大了新建场景（`B1`/`B3`/`B4`）的相对表现；一旦两边同样使用 `outBuf` 复用，**A1–A6 依然有 9.21x ~ 26.40x（ReuseB）与 4.37x ~ 21.32x（Imm）的巨大优势**，而 `B2` / `B3` 全量读写场景的 2-Pass 代价（`0.40x ~ 0.56x`）也更真实客观。
+   - C++ 中，接入真实 `libprotobuf 3.21.12` 后，连先前相对精简手写 struct 落后的 `B1（从零构建）` 对真实 `libprotobuf` 也实现了 **`1.65x ~ 2.52x`** 领先（而相对手写 Eager 依然清晰标明为 `254.9 ns` vs `430.5 ns`）。
+2. **仓库索引**：
+   - 统一协议定义：[order_envelope.proto](/home/inu4g0t/t3work/lazy-proto/proto/order_envelope.proto)
+   - Java 测试与基准：[pom.xml](/home/inu4g0t/t3work/lazy-proto/pom.xml)、[LazyProtoBenchmarkSuite.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoBenchmarkSuite.java)、[LazyProtoCorrectnessTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoCorrectnessTest.java)、[StatefulModelFuzzTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/StatefulModelFuzzTest.java)
+   - C++ 构建与基准：[Makefile](/home/inu4g0t/t3work/lazy-proto/cpp/Makefile)、[lazy_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/lazy_proto.hpp)、[std_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/std_proto.hpp)、[benchmark_main.cpp](/home/inu4g0t/t3work/lazy-proto/cpp/benchmark_main.cpp)
