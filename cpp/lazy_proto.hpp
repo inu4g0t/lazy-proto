@@ -566,12 +566,19 @@ public:
 
     bool is_scanned() const noexcept { return scanned_; }
     bool is_clean() const noexcept {
-        return !multi_segment_ && !replaced_from_wrap_
+        return !replaced_from_wrap_ && is_self_clean();
+    }
+    bool is_same_size_dirty_only() const noexcept {
+        return !replaced_from_wrap_ && is_self_same_size_dirty_only();
+    }
+
+    bool is_self_clean() const noexcept {
+        return !multi_segment_
             && same_size_dirty_count_ == 0 && var_size_dirty_count_ == 0
             && appended_count_ == 0 && !has_deleted_;
     }
-    bool is_same_size_dirty_only() const noexcept {
-        return !multi_segment_ && !replaced_from_wrap_
+    bool is_self_same_size_dirty_only() const noexcept {
+        return !multi_segment_
             && var_size_dirty_count_ == 0 && appended_count_ == 0
             && !has_deleted_ && same_size_dirty_count_ != 0;
     }
@@ -837,7 +844,7 @@ public:
     }
 
     size_t max_merged_size() const noexcept {
-        if (is_clean() || is_same_size_dirty_only()) {
+        if (is_self_clean() || is_self_same_size_dirty_only()) {
             return raw_len_;
         }
         size_t upper = raw_len_;
@@ -865,12 +872,12 @@ public:
     }
 
     size_t merge_to(uint8_t* out_buf, size_t out_cap) const {
-        if (is_clean()) {
+        if (is_self_clean()) {
             if (out_cap < raw_len_) throw std::length_error("WireView output buffer too small");
             if (raw_len_ > 0) std::memcpy(out_buf, buf_, raw_len_);
             return raw_len_;
         }
-        if (is_same_size_dirty_only()) {
+        if (is_self_same_size_dirty_only()) {
             if (out_cap < raw_len_) throw std::length_error("WireView output buffer too small");
             if (raw_len_ > 0) std::memcpy(out_buf, buf_, raw_len_);
             apply_in_place_patches(out_buf);
@@ -1179,11 +1186,11 @@ private:
     }
 
     void write_spliced_to(WireWriter& w) const noexcept {
-        if (is_clean()) {
+        if (is_self_clean()) {
             if (raw_len_ > 0) w.write_raw(buf_, raw_len_);
             return;
         }
-        if (is_same_size_dirty_only()) {
+        if (is_self_same_size_dirty_only()) {
             uint8_t* start = w.ptr;
             if (raw_len_ > 0) w.write_raw(buf_, raw_len_);
             apply_in_place_patches(start);

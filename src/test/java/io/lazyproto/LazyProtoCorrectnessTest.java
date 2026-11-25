@@ -934,4 +934,84 @@ public class LazyProtoCorrectnessTest {
             assertEquals("OVERLONG_20B_HDR", compatOver.getBuyerName());
         }
     }
+
+    @Test
+    public void testF3_Issue8LowerLevelEdgeCases() throws Exception {
+        // 1. RawWireView: child.wrap() with zero getters called on child before parent serialization
+        {
+            byte[] pIn = new byte[] {0x2A, 0x02, 0x08, 0x01}; // #5: user_id=1
+            RawWireView wv = new RawWireView().wrap(pIn, 0, pIn.length);
+            wv.sub(5).wrap(new byte[] {0x08, 0x02}, 0, 2); // replace with user_id=2, NO getters called
+            byte[] out = wv.toByteArray();
+            assertEquals("2a020802", bytesToHex(out));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals(2L, dec.getUser().getUserId());
+
+            // Also verify repeatedSub().wrap() with zero getters called
+            byte[] repIn = new byte[] {0x32, 0x02, 0x18, 0x01}; // #6: quantity=1
+            RawWireView rWv = new RawWireView().wrap(repIn, 0, repIn.length);
+            rWv.repeatedSub(6, 0).wrap(new byte[] {0x18, 0x09}, 0, 2);
+            byte[] repOut = rWv.toByteArray();
+            assertEquals("32021809", bytesToHex(repOut));
+            io.lazyproto.bench.proto.OrderEnvelope decRep = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(repOut);
+            assertEquals(9, decRep.getItems(0).getQuantity());
+        }
+
+        // 2. RawWireView: cached repeatedSub followed by setBytes must honor explicit setBytes override
+        {
+            byte[] repIn = new byte[] {0x32, 0x02, 0x18, 0x01};
+            RawWireView wv = new RawWireView().wrap(repIn, 0, repIn.length);
+            assertEquals(1, wv.repeatedSub(6, 0).getInt32(3));
+            wv.setBytes(6, new byte[] {24, (byte) 129, 1}, 0, 3);
+            byte[] out = wv.toByteArray();
+            assertEquals("3203188101", bytesToHex(out));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals(129, dec.getItems(0).getQuantity());
+        }
+
+        // 3. RawOrderEnvelope: >128 items with partial access/edit on item(0) only
+        {
+            io.lazyproto.bench.proto.OrderEnvelope.Builder b = io.lazyproto.bench.proto.OrderEnvelope.newBuilder()
+                    .setOrderId(9001L)
+                    .setBuyerName("buyer_200");
+            for (int i = 0; i < 200; i++) {
+                b.addItems(io.lazyproto.bench.proto.LineItem.newBuilder()
+                        .setItemId(1000L + i)
+                        .setSku("SKU-" + i)
+                        .setQuantity(i + 1)
+                        .setPriceCents(50L + i)
+                        .build());
+            }
+            byte[] raw200 = b.build().toByteArray();
+
+            RawOrderEnvelope env = new RawOrderEnvelope().wrap(raw200, 0, raw200.length);
+            // Var-size edit on item(0) only (activeItemStates.length == 128 < itemCount == 200)
+            env.items(0).setSku("UPDATED_VAR_LEN_SKU_000");
+            byte[] varOut = env.toByteArray();
+            io.lazyproto.bench.proto.OrderEnvelope decVar = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(varOut);
+            assertEquals(200, decVar.getItemsCount());
+            assertEquals("UPDATED_VAR_LEN_SKU_000", decVar.getItems(0).getSku());
+            assertEquals("SKU-199", decVar.getItems(199).getSku());
+
+            // Same-size edit on item(0) only (also checks applyInPlacePatches loop bound)
+            env.wrap(raw200, 0, raw200.length);
+            env.items(0).setSku("X-000"); // same length as "SKU-0"
+            byte[] sameOut = new byte[raw200.length];
+            int written = env.writeToBuffer(sameOut, 0);
+            assertEquals(raw200.length, written);
+            io.lazyproto.bench.proto.OrderEnvelope decSame = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(sameOut);
+            assertEquals(200, decSame.getItemsCount());
+            assertEquals("X-000", decSame.getItems(0).getSku());
+            assertEquals("SKU-199", decSame.getItems(199).getSku());
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(Character.forDigit((b >>> 4) & 0xF, 16));
+            sb.append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
 }

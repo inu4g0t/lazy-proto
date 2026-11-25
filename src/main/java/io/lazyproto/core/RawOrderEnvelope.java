@@ -630,7 +630,8 @@ public final class RawOrderEnvelope {
             sz += 1 + WireWriter.varint32Size(usz) + usz;
         }
         if ((d & BIT_ITEMS) != 0) {
-            for (int i = 0; i < itemCount; i++) {
+            int itemLimit = Math.min(itemCount, activeItemStates.length);
+            for (int i = 0; i < itemLimit; i++) {
                 if (activeItemStates[i] == 2 && activeItems[i] != null) {
                     int isz = activeItems[i].maxSerializedSize();
                     sz += 1 + WireWriter.varint32Size(isz) + isz;
@@ -670,7 +671,8 @@ public final class RawOrderEnvelope {
             if (slot == SLOT_USER) {
                 user.applyInPlacePatches(target, baseOffset);
             } else if (slot == SLOT_ITEMS) {
-                for (int i = 0; i < itemCount; i++) {
+                int itemLimit = Math.min(itemCount, activeItemStates.length);
+                for (int i = 0; i < itemLimit; i++) {
                     if (activeItemStates[i] == 1 && activeItems[i] != null) {
                         activeItems[i].applyInPlacePatches(target, baseOffset);
                     }

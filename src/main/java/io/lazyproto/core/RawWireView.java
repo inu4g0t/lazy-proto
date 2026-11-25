@@ -142,12 +142,20 @@ public final class RawWireView {
     public boolean isScanned() { return tape.scanned; }
 
     public boolean isClean() {
-        return !tape.multiSegment && !replacedFromWrap
+        return !replacedFromWrap && isSelfClean();
+    }
+
+    private boolean isSelfClean() {
+        return !tape.multiSegment
                 && sameSizeDirtyCount == 0 && varSizeDirtyCount == 0 && appendedCount == 0 && !hasDeleted;
     }
 
     public boolean isSameSizeDirtyOnly() {
-        return !tape.multiSegment && !replacedFromWrap
+        return !replacedFromWrap && isSelfSameSizeDirtyOnly();
+    }
+
+    private boolean isSelfSameSizeDirtyOnly() {
+        return !tape.multiSegment
                 && varSizeDirtyCount == 0 && appendedCount == 0 && !hasDeleted && sameSizeDirtyCount > 0;
     }
 
@@ -454,6 +462,9 @@ public final class RawWireView {
         fc.bytesInArena = false;
         fc.extBytes = null;
         fc.stringCache = null;
+        if (fc.repSubViews != null && fc.repCount > 0) {
+            Arrays.fill(fc.repSubViews, 0, fc.repCount, null);
+        }
         if (fc.repSubEpochs != null && fc.repCount > 0) {
             Arrays.fill(fc.repSubEpochs, 0, fc.repCount, -1);
         }
@@ -551,7 +562,7 @@ public final class RawWireView {
     }
 
     public int maxSerializedSize() {
-        if (isClean() || isSameSizeDirtyOnly()) {
+        if (isSelfClean() || isSelfSameSizeDirtyOnly()) {
             return tape.rawLength;
         }
         int sz = tape.rawLength;
@@ -559,10 +570,10 @@ public final class RawWireView {
             FieldSlot fc = slots[i];
             if (fc.varSizeDirty || fc.appended || fc.repDirtyCount > 0) {
                 int tagSz = WireWriter.tagSize(fc.fieldNumber);
-                if (fc.repDirtyCount > 0 && fc.repSubViews != null) {
+                if (!fc.bytesOverride && fc.repDirtyCount > 0 && fc.repSubViews != null) {
                     for (int r = 0; r < fc.repCount; r++) {
                         RawWireView rv = fc.repSubViews[r];
-                        if (rv != null && !rv.isClean()) {
+                        if (rv != null && (fc.repSubEpochs == null || fc.repSubEpochs[r] == wrapEpoch) && !rv.isClean()) {
                             int subMax = rv.maxSerializedSize();
                             sz += tagSz + WireWriter.varint32Size(subMax) + subMax;
                         }
@@ -586,12 +597,12 @@ public final class RawWireView {
     }
 
     public int writeToBuffer(byte[] outBuf, int outOffset) {
-        if (isClean()) {
+        if (isSelfClean()) {
             int len = tape.rawLength;
             if (len > 0) System.arraycopy(tape.buf, tape.rawOffset, outBuf, outOffset, len);
             return len;
         }
-        if (isSameSizeDirtyOnly()) {
+        if (isSelfSameSizeDirtyOnly()) {
             int len = tape.rawLength;
             if (len > 0) System.arraycopy(tape.buf, tape.rawOffset, outBuf, outOffset, len);
             applyInPlacePatches(outBuf, tape.rawOffset - outOffset);
@@ -631,10 +642,11 @@ public final class RawWireView {
                         WireWriter.patchBytesAt(target, pos, fc.extBytes, fc.extOff, fc.extLen);
                     }
                 }
-            } else if (fc.repSubViews != null) {
+            } else if (!fc.bytesOverride && fc.repSubViews != null) {
                 for (int r = 0; r < fc.repCount; r++) {
                     RawWireView child = fc.repSubViews[r];
-                    if (child != null && tape.flags(fc.repTapeIdx[r]) == WireTape.FLAG_DIRTY_SAME_SIZE) {
+                    if (child != null && (fc.repSubEpochs == null || fc.repSubEpochs[r] == wrapEpoch)
+                            && tape.flags(fc.repTapeIdx[r]) == WireTape.FLAG_DIRTY_SAME_SIZE) {
                         int pos = tape.valueOffset(fc.repTapeIdx[r]) - baseOffset;
                         child.applyInPlacePatches(target, tape.valueOffset(fc.repTapeIdx[r]) - pos);
                     }
@@ -644,6 +656,20 @@ public final class RawWireView {
     }
 
     private void writeSplicedTo(WireWriter w) {
+        if (isSelfClean()) {
+            if (tape.rawLength > 0) {
+                w.writeRawBytes(tape.buf, tape.rawOffset, tape.rawLength);
+            }
+            return;
+        }
+        if (isSelfSameSizeDirtyOnly()) {
+            int start = w.position();
+            if (tape.rawLength > 0) {
+                w.writeRawBytes(tape.buf, tape.rawOffset, tape.rawLength);
+                applyInPlacePatches(w.buffer(), tape.rawOffset - start);
+            }
+            return;
+        }
         if (tape.tapeCount > 0) {
             tape.spliceTo(w, dirtyWriter);
         }
@@ -659,9 +685,10 @@ public final class RawWireView {
         int sIdx = findSlotIdx(fn);
         if (sIdx < 0) return;
         FieldSlot fc = slots[sIdx];
-        if (fc.repSubViews != null && wt == WireFormat.WIRETYPE_LENGTH_DELIMITED) {
+        if (!fc.bytesOverride && fc.repSubViews != null && wt == WireFormat.WIRETYPE_LENGTH_DELIMITED) {
             for (int r = 0; r < fc.repCount; r++) {
-                if (fc.repTapeIdx[r] == tapeIdx && fc.repSubViews[r] != null) {
+                if (fc.repTapeIdx[r] == tapeIdx && fc.repSubViews[r] != null
+                        && (fc.repSubEpochs == null || fc.repSubEpochs[r] == wrapEpoch)) {
                     int lenSlot = writer.beginSubmessage(fn);
                     fc.repSubViews[r].writeSplicedTo(writer);
                     writer.endSubmessage(lenSlot);

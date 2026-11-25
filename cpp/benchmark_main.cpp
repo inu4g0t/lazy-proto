@@ -415,6 +415,35 @@ void run_correctness_tests() {
                 LP_CHECK(reused.items(42).quantity() == (42 % 5) + 1);
             }
         }
+
+        // Issue #8 (f): sub.wrap() / repeated_sub.wrap() without calling any child getter
+        {
+            const uint8_t p_in[] = {0x2A, 0x02, 0x08, 0x01};
+            WireView wv(p_in, sizeof(p_in));
+            const uint8_t u2[] = {0x08, 0x02};
+            wv.sub(5).wrap(u2, sizeof(u2));
+            std::string out_u;
+            wv.merge_to(out_u);
+            LP_CHECK(out_u.size() == 4);
+            LP_CHECK(static_cast<uint8_t>(out_u[0]) == 0x2A && static_cast<uint8_t>(out_u[1]) == 0x02
+                  && static_cast<uint8_t>(out_u[2]) == 0x08 && static_cast<uint8_t>(out_u[3]) == 0x02);
+            pb::OrderEnvelope pb_u;
+            LP_CHECK(pb_u.ParseFromArray(out_u.data(), static_cast<int>(out_u.size())));
+            LP_CHECK(pb_u.user().user_id() == 2);
+
+            const uint8_t rep_in[] = {0x32, 0x02, 0x18, 0x01};
+            WireView r_wv(rep_in, sizeof(rep_in));
+            const uint8_t q9[] = {0x18, 0x09};
+            r_wv.repeated_sub(6, 0).wrap(q9, sizeof(q9));
+            std::string out_r;
+            r_wv.merge_to(out_r);
+            LP_CHECK(out_r.size() == 4);
+            LP_CHECK(static_cast<uint8_t>(out_r[0]) == 0x32 && static_cast<uint8_t>(out_r[1]) == 0x02
+                  && static_cast<uint8_t>(out_r[2]) == 0x18 && static_cast<uint8_t>(out_r[3]) == 0x09);
+            pb::OrderEnvelope pb_r;
+            LP_CHECK(pb_r.ParseFromArray(out_r.data(), static_cast<int>(out_r.size())));
+            LP_CHECK(pb_r.items_size() == 1 && pb_r.items(0).quantity() == 9);
+        }
     }
 
     // 7. B1: From-Scratch Construction
