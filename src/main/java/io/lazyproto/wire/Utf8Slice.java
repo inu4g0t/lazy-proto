@@ -1,9 +1,5 @@
 package io.lazyproto.wire;
 
-import com.google.protobuf.ByteString;
-import com.google.protobuf.UnsafeByteOperations;
-import java.nio.charset.StandardCharsets;
-
 /**
  * Zero-copy UTF-8 slice view over a raw byte array, implementing {@link CharSequence}
  * so callers can inspect or compare string fields without allocating {@link String}.
@@ -86,13 +82,6 @@ public final class Utf8Slice implements CharSequence {
         return java.util.Arrays.equals(
                 buf, offset, offset + length,
                 expectedUtf8, 0, expectedUtf8.length);
-    }
-
-    /**
-     * Zero-copy bridge to Google Protobuf {@link ByteString}.
-     */
-    public ByteString toByteStringZeroCopy() {
-        return UnsafeByteOperations.unsafeWrap(buf, offset, length);
     }
 
     @Override

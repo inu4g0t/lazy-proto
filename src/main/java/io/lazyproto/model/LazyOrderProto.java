@@ -11,6 +11,7 @@ import io.lazyproto.runtime.AbstractLazyBuilder;
 import io.lazyproto.runtime.AbstractLazyMessage;
 import io.lazyproto.runtime.ImmutableLazyList;
 import io.lazyproto.runtime.ImmutableWireBase;
+import io.lazyproto.runtime.ProtobufCompat;
 import io.lazyproto.runtime.WireMergeEngine;
 import io.lazyproto.runtime.WireOverlay;
 import io.lazyproto.wire.Utf8Slice;
@@ -379,12 +380,12 @@ public final class LazyOrderProto {
         @Override public long getUserId() { return UserOps.getUserId(base, overlay); }
         @Override public String getCity() { return UserOps.getCity(base, overlay); }
         public Utf8Slice getCitySlice() { return UserOps.getCitySlice(base, overlay, citySlice_); }
-        @Override public ByteString getCityBytes() { return getCitySlice().toByteStringZeroCopy(); }
+        @Override public ByteString getCityBytes() { return ProtobufCompat.toByteString(getCitySlice()); }
         @Override public int getVipLevel() { return UserOps.getVipLevel(base, overlay); }
         @Override public double getScore() { return UserOps.getScore(base, overlay); }
         @Override public String getEmail() { return UserOps.getEmail(base, overlay); }
         public Utf8Slice getEmailSlice() { return UserOps.getEmailSlice(base, overlay, emailSlice_); }
-        @Override public ByteString getEmailBytes() { return getEmailSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getEmailBytes() { return ProtobufCompat.toByteString(getEmailSlice()); }
         public Message getDefaultInstanceForType() { return EMPTY; }
         @Override public Builder newBuilderForType() { return newBuilder(); }
         @Override public Builder toBuilder() { return new Builder(base, overlay != null ? overlay.copyMutable() : null); }
@@ -474,7 +475,7 @@ public final class LazyOrderProto {
 
             @Override public String getCity() { return UserOps.getCity(resolveReadBase(), resolveReadOverlay()); }
             @Override public ByteString getCityBytes() {
-                return UserOps.getCitySlice(resolveReadBase(), resolveReadOverlay(), citySlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(UserOps.getCitySlice(resolveReadBase(), resolveReadOverlay(), citySlice_));
             }
             public Builder setCity(String v) {
                 UserOverlay ov = ensureMutableOverlay();
@@ -508,7 +509,7 @@ public final class LazyOrderProto {
 
             @Override public String getEmail() { return UserOps.getEmail(resolveReadBase(), resolveReadOverlay()); }
             @Override public ByteString getEmailBytes() {
-                return UserOps.getEmailSlice(resolveReadBase(), resolveReadOverlay(), emailSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(UserOps.getEmailSlice(resolveReadBase(), resolveReadOverlay(), emailSlice_));
             }
             public Builder setEmail(String v) {
                 UserOverlay ov = ensureMutableOverlay();
@@ -883,12 +884,12 @@ public final class LazyOrderProto {
         @Override public long getItemId() { return LineItemOps.getItemId(base, overlay); }
         @Override public String getSku() { return LineItemOps.getSku(base, overlay); }
         public Utf8Slice getSkuSlice() { return LineItemOps.getSkuSlice(base, overlay, skuSlice_); }
-        @Override public ByteString getSkuBytes() { return getSkuSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getSkuBytes() { return ProtobufCompat.toByteString(getSkuSlice()); }
         @Override public int getQuantity() { return LineItemOps.getQuantity(base, overlay); }
         @Override public long getPriceCents() { return LineItemOps.getPriceCents(base, overlay); }
         @Override public String getDescription() { return LineItemOps.getDescription(base, overlay); }
         public Utf8Slice getDescriptionSlice() { return LineItemOps.getDescriptionSlice(base, overlay, descriptionSlice_); }
-        @Override public ByteString getDescriptionBytes() { return getDescriptionSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getDescriptionBytes() { return ProtobufCompat.toByteString(getDescriptionSlice()); }
         public Message getDefaultInstanceForType() { return EMPTY; }
         @Override public Builder newBuilderForType() { return newBuilder(); }
         @Override public Builder toBuilder() { return new Builder(base, overlay != null ? overlay.copyMutable() : null); }
@@ -981,7 +982,7 @@ public final class LazyOrderProto {
             @Override public String getSku() { return LineItemOps.getSku(resolveReadBase(), resolveReadOverlay()); }
             @Override public ByteString getSkuBytes() {
                 if (skuSlice_ == null) skuSlice_ = new Utf8Slice();
-                return LineItemOps.getSkuSlice(resolveReadBase(), resolveReadOverlay(), skuSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(LineItemOps.getSkuSlice(resolveReadBase(), resolveReadOverlay(), skuSlice_));
             }
             public Builder setSku(String v) {
                 LineItemOverlay ov = ensureMutableOverlay();
@@ -1016,7 +1017,7 @@ public final class LazyOrderProto {
             @Override public String getDescription() { return LineItemOps.getDescription(resolveReadBase(), resolveReadOverlay()); }
             @Override public ByteString getDescriptionBytes() {
                 if (descriptionSlice_ == null) descriptionSlice_ = new Utf8Slice();
-                return LineItemOps.getDescriptionSlice(resolveReadBase(), resolveReadOverlay(), descriptionSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(LineItemOps.getDescriptionSlice(resolveReadBase(), resolveReadOverlay(), descriptionSlice_));
             }
             public Builder setDescription(String v) {
                 LineItemOverlay ov = ensureMutableOverlay();
@@ -1441,7 +1442,12 @@ public final class LazyOrderProto {
             this.dirtyBaseCount = 0;
             this.sameSizeDirtyCount = 0;
             if (appendedSlots != null) {
-                Arrays.fill(appendedSlots, 0, appendedCount, null);
+                for (int i = 0; i < appendedCount; i++) {
+                    ItemSlot s = appendedSlots[i];
+                    if (s != null && (s.replaced || s.patch == null || s.patch.isFrozen() || s.base != LineItemBase.EMPTY)) {
+                        appendedSlots[i] = null;
+                    }
+                }
             }
             this.appendedCount = 0;
         }
@@ -1561,6 +1567,22 @@ public final class LazyOrderProto {
                 appendedSlots = Arrays.copyOf(appendedSlots, appendedSlots.length << 1);
             }
             appendedSlots[appendedCount++] = ItemSlot.forReplaced(item);
+        }
+
+        int addAppendedBuilderSlot() {
+            if (appendedSlots == null) {
+                appendedSlots = new ItemSlot[4];
+            } else if (appendedCount >= appendedSlots.length) {
+                appendedSlots = Arrays.copyOf(appendedSlots, appendedSlots.length << 1);
+            }
+            ItemSlot existing = appendedSlots[appendedCount];
+            if (existing != null && !existing.replaced && existing.patch != null
+                    && !existing.patch.isFrozen() && existing.base == LineItemBase.EMPTY) {
+                existing.patch.reset();
+            } else {
+                appendedSlots[appendedCount] = ItemSlot.forPatch(LineItemBase.EMPTY, new LineItemOverlay());
+            }
+            return appendedCount++;
         }
     }
 
@@ -2168,7 +2190,7 @@ public final class LazyOrderProto {
         @Override public long getOrderId() { return OrderOps.getOrderId(base, overlay); }
         @Override public String getBuyerName() { return OrderOps.getBuyerName(base, overlay); }
         public Utf8Slice getBuyerNameSlice() { return OrderOps.getBuyerNameSlice(base, overlay, buyerNameSlice_); }
-        @Override public ByteString getBuyerNameBytes() { return getBuyerNameSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getBuyerNameBytes() { return ProtobufCompat.toByteString(getBuyerNameSlice()); }
         @Override public int getStatus() { return OrderOps.getStatus(base, overlay); }
         @Override public long getUpdatedAtFixed64() { return OrderOps.getUpdatedAtFixed64(base, overlay); }
         @Override public boolean hasUser() { return OrderOps.hasUser(base, overlay); }
@@ -2188,10 +2210,10 @@ public final class LazyOrderProto {
         @Override public ByteString getPayload() { return OrderOps.getPayload(base, overlay); }
         @Override public String getAuthToken() { return OrderOps.getAuthToken(base, overlay); }
         public Utf8Slice getAuthTokenSlice() { return OrderOps.getAuthTokenSlice(base, overlay, authTokenSlice_); }
-        @Override public ByteString getAuthTokenBytes() { return getAuthTokenSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getAuthTokenBytes() { return ProtobufCompat.toByteString(getAuthTokenSlice()); }
         @Override public String getTraceId() { return OrderOps.getTraceId(base, overlay); }
         public Utf8Slice getTraceIdSlice() { return OrderOps.getTraceIdSlice(base, overlay, traceIdSlice_); }
-        @Override public ByteString getTraceIdBytes() { return getTraceIdSlice().toByteStringZeroCopy(); }
+        @Override public ByteString getTraceIdBytes() { return ProtobufCompat.toByteString(getTraceIdSlice()); }
         @Override public long getTotalCents() { return OrderOps.getTotalCents(base, overlay); }
 
         public Message getDefaultInstanceForType() { return EMPTY; }
@@ -2524,7 +2546,7 @@ public final class LazyOrderProto {
 
             @Override public String getBuyerName() { return OrderOps.getBuyerName(base, overlay); }
             @Override public ByteString getBuyerNameBytes() {
-                return OrderOps.getBuyerNameSlice(base, overlay, buyerNameSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(OrderOps.getBuyerNameSlice(base, overlay, buyerNameSlice_));
             }
             public Builder setBuyerName(String v) {
                 OrderOverlay ov = ensureMutableOverlay();
@@ -2673,6 +2695,14 @@ public final class LazyOrderProto {
                 return addItems(itemBuilder.build());
             }
 
+            public LazyLineItem.Builder addItemsBuilder() {
+                ItemsOverlay io = ensureMutableItemsOverlay();
+                int baseActive = io.cleared ? 0 : base.ensureScannedReturnItemsCount();
+                int appIdx = io.addAppendedBuilderSlot();
+                recomputeParentItemsMasks(this.overlay, io);
+                return new LazyLineItem.Builder(this, baseActive + appIdx);
+            }
+
             public Builder clearItems() {
                 ItemsOverlay io = ensureMutableItemsOverlay();
                 base.ensureScanned();
@@ -2700,7 +2730,7 @@ public final class LazyOrderProto {
 
             @Override public String getAuthToken() { return OrderOps.getAuthToken(base, overlay); }
             @Override public ByteString getAuthTokenBytes() {
-                return OrderOps.getAuthTokenSlice(base, overlay, authTokenSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(OrderOps.getAuthTokenSlice(base, overlay, authTokenSlice_));
             }
             public Builder setAuthToken(String v) {
                 OrderOverlay ov = ensureMutableOverlay();
@@ -2730,7 +2760,7 @@ public final class LazyOrderProto {
 
             @Override public String getTraceId() { return OrderOps.getTraceId(base, overlay); }
             @Override public ByteString getTraceIdBytes() {
-                return OrderOps.getTraceIdSlice(base, overlay, traceIdSlice_).toByteStringZeroCopy();
+                return ProtobufCompat.toByteString(OrderOps.getTraceIdSlice(base, overlay, traceIdSlice_));
             }
             public Builder setTraceId(String v) {
                 OrderOverlay ov = ensureMutableOverlay();

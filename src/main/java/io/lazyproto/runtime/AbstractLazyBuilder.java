@@ -163,7 +163,11 @@ public abstract class AbstractLazyBuilder<
         }
         this.base.markScannedEmpty();
         if (this.overlay != null) {
-            this.overlay = null;
+            if (this.overlay.isFrozen()) {
+                this.overlay = null;
+            } else {
+                resetOverlayInPlace(this.overlay);
+            }
         }
         return self();
     }

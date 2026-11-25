@@ -103,6 +103,44 @@ public final class WireWriter {
         writeLengthDelimitedBytes(fieldNumber, utf8, 0, utf8.length);
     }
 
+    /**
+     * Begins a single-pass length-delimited sub-message with a 1-byte tag and a speculative 1-byte length slot.
+     * Must be paired with {@link #endSubmessage(int)}.
+     */
+    public int beginSubmessageOneByteTag(int oneByteTag) {
+        out[pos++] = (byte) oneByteTag;
+        int lenSlot = pos++;
+        return lenSlot;
+    }
+
+    /**
+     * Begins a single-pass length-delimited sub-message with a multi-byte tag and speculative 1-byte length slot.
+     */
+    public int beginSubmessage(int fieldNumber) {
+        writeTag(fieldNumber, WireFormat.WIRETYPE_LENGTH_DELIMITED);
+        int lenSlot = pos++;
+        return lenSlot;
+    }
+
+    /**
+     * Backpatches the sub-message length written since {@link #beginSubmessageOneByteTag(int)}, shifting
+     * the body only when {@code bodyLen >= 128}.
+     */
+    public void endSubmessage(int lenSlot) {
+        int bodyStart = lenSlot + 1;
+        int bodyLen = pos - bodyStart;
+        if (bodyLen < 128) {
+            out[lenSlot] = (byte) bodyLen;
+        } else {
+            int lenBytes = varint32Size(bodyLen);
+            System.arraycopy(out, bodyStart, out, lenSlot + lenBytes, bodyLen);
+            int saved = pos;
+            pos = lenSlot;
+            writeVarint32(bodyLen);
+            pos = saved + (lenBytes - 1);
+        }
+    }
+
     // ==================== In-Place Patching Helpers (Fast-Path 1) ====================
 
     public static void patchVarint32At(byte[] target, int pos, int value) {

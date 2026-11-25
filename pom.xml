@@ -17,18 +17,93 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <protobuf.version>3.25.5</protobuf.version>
         <junit.version>5.10.2</junit.version>
-        <os.detected.classifier>linux-x86_64</os.detected.classifier>
+        <protoc.classifier>linux-x86_64</protoc.classifier>
+        <protoc.filename>protoc</protoc.filename>
+        <protoc.skip.chmod>false</protoc.skip.chmod>
+        <protoc.mkdir.cmd>sh</protoc.mkdir.cmd>
+        <protoc.mkdir.arg1>-c</protoc.mkdir.arg1>
+        <protoc.mkdir.arg2>mkdir -p "${project.build.directory}/generated-test-sources/protobuf/java"</protoc.mkdir.arg2>
     </properties>
 
+    <profiles>
+        <profile>
+            <id>os-linux-x86_64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>amd64</arch>
+                </os>
+            </activation>
+            <properties>
+                <protoc.classifier>linux-x86_64</protoc.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>os-linux-aarch64</id>
+            <activation>
+                <os>
+                    <family>unix</family>
+                    <name>linux</name>
+                    <arch>aarch64</arch>
+                </os>
+            </activation>
+            <properties>
+                <protoc.classifier>linux-aarch_64</protoc.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>os-mac-x86_64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>x86_64</arch>
+                </os>
+            </activation>
+            <properties>
+                <protoc.classifier>osx-x86_64</protoc.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>os-mac-aarch64</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                    <arch>aarch64</arch>
+                </os>
+            </activation>
+            <properties>
+                <protoc.classifier>osx-aarch_64</protoc.classifier>
+            </properties>
+        </profile>
+        <profile>
+            <id>os-windows-x86_64</id>
+            <activation>
+                <os>
+                    <family>windows</family>
+                    <arch>amd64</arch>
+                </os>
+            </activation>
+            <properties>
+                <protoc.classifier>windows-x86_64</protoc.classifier>
+                <protoc.filename>protoc.exe</protoc.filename>
+                <protoc.skip.chmod>true</protoc.skip.chmod>
+                <protoc.mkdir.cmd>cmd</protoc.mkdir.cmd>
+                <protoc.mkdir.arg1>/c</protoc.mkdir.arg1>
+                <protoc.mkdir.arg2>if not exist "${project.build.directory}\generated-test-sources\protobuf\java" mkdir "${project.build.directory}\generated-test-sources\protobuf\java"</protoc.mkdir.arg2>
+            </properties>
+        </profile>
+    </profiles>
+
     <dependencies>
-        <!-- Official Google Protobuf runtime for interface compatibility (Message, MessageOrBuilder, ByteString, UnsafeByteOperations) and real protoc-generated baseline benchmark comparison -->
+        <!-- Official Google Protobuf runtime for interface compatibility (Intermediate Layer) & protoc baseline comparison -->
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>
             <version>${protobuf.version}</version>
         </dependency>
 
-        <!-- JUnit 5 for correctness verification -->
+        <!-- JUnit 5 for correctness & benchmark suite -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -39,7 +114,7 @@
 
     <build>
         <plugins>
-            <!-- Fetch protoc 3.25.5 matching protobuf-java 3.25.5 cleanly for test baseline generation -->
+            <!-- Fetch platform-matched protoc 3.25.5 matching protobuf-java 3.25.5 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>
@@ -57,10 +132,10 @@
                                     <groupId>com.google.protobuf</groupId>
                                     <artifactId>protoc</artifactId>
                                     <version>${protobuf.version}</version>
-                                    <classifier>${os.detected.classifier}</classifier>
+                                    <classifier>${protoc.classifier}</classifier>
                                     <type>exe</type>
                                     <outputDirectory>${project.build.directory}/protoc</outputDirectory>
-                                    <destFileName>protoc</destFileName>
+                                    <destFileName>${protoc.filename}</destFileName>
                                 </artifactItem>
                             </artifactItems>
                         </configuration>
@@ -73,16 +148,31 @@
                 <version>3.2.0</version>
                 <executions>
                     <execution>
+                        <id>prepare-proto-out-dir</id>
+                        <phase>generate-test-sources</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <executable>${protoc.mkdir.cmd}</executable>
+                            <arguments>
+                                <argument>${protoc.mkdir.arg1}</argument>
+                                <argument>${protoc.mkdir.arg2}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
                         <id>chmod-protoc</id>
                         <phase>generate-test-sources</phase>
                         <goals>
                             <goal>exec</goal>
                         </goals>
                         <configuration>
+                            <skip>${protoc.skip.chmod}</skip>
                             <executable>chmod</executable>
                             <arguments>
                                 <argument>+x</argument>
-                                <argument>${project.build.directory}/protoc/protoc</argument>
+                                <argument>${project.build.directory}/protoc/${protoc.filename}</argument>
                             </arguments>
                         </configuration>
                     </execution>
@@ -93,10 +183,11 @@
                             <goal>exec</goal>
                         </goals>
                         <configuration>
-                            <executable>sh</executable>
+                            <executable>${project.build.directory}/protoc/${protoc.filename}</executable>
                             <arguments>
-                                <argument>-c</argument>
-                                <argument>mkdir -p "${project.build.directory}/generated-test-sources/protobuf/java" &amp;&amp; "${project.build.directory}/protoc/protoc" --proto_path="${project.basedir}/proto" --java_out="${project.build.directory}/generated-test-sources/protobuf/java" "${project.basedir}/proto/order_envelope.proto"</argument>
+                                <argument>--proto_path=${project.basedir}/proto</argument>
+                                <argument>--java_out=${project.build.directory}/generated-test-sources/protobuf/java</argument>
+                                <argument>${project.basedir}/proto/order_envelope.proto</argument>
                             </arguments>
                         </configuration>
                     </execution>

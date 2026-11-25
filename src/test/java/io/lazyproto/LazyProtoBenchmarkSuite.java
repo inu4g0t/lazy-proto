@@ -6,6 +6,7 @@ import com.sun.management.ThreadMXBean;
 import io.lazyproto.bench.proto.LineItem;
 import io.lazyproto.bench.proto.OrderEnvelope;
 import io.lazyproto.bench.proto.UserProfile;
+import io.lazyproto.core.RawOrderEnvelope;
 import io.lazyproto.model.LazyOrderProto.LazyLineItem;
 import io.lazyproto.model.LazyOrderProto.LazyOrderEnvelope;
 import io.lazyproto.model.LazyOrderProto.LazyUserProfile;
@@ -64,7 +65,8 @@ public class LazyProtoBenchmarkSuite {
             Metric officialReuseBuilderOutBuf,
             Metric handEagerOutBuf,
             Metric lazyImmOutBuf,
-            Metric lazyReuseBuilderOutBuf
+            Metric lazyReuseBuilderOutBuf,
+            Metric rawLowerOutBuf
     ) {}
 
     private static volatile long blackhole = 0;
@@ -131,6 +133,7 @@ public class LazyProtoBenchmarkSuite {
 
         final LazyOrderEnvelope.Builder reusableLazyBuilder = LazyOrderEnvelope.newBuilder();
         final OrderEnvelope.Builder reusableOfficialBuilder = OrderEnvelope.newBuilder();
+        final RawOrderEnvelope reusableRaw = new RawOrderEnvelope();
         final byte[] reusableOutBuf = new byte[complexBytes.length + 4096];
 
         final int WARMUP = 6_000;
@@ -169,8 +172,12 @@ public class LazyProtoBenchmarkSuite {
                 return reusableLazyBuilder.getOrderId() + reusableLazyBuilder.getStatus()
                         + reusableLazyBuilder.getUserOrBuilder().getVipLevel();
             });
+            Metric mRawLower = measure(WARMUP, ITERS, i -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length);
+                return reusableRaw.getOrderId() + reusableRaw.getStatus() + reusableRaw.user().getVipLevel();
+            });
             trackII.add(new TrackIIRow("Advantageous (A1)", "Partial Read (3 fields, no outBuf)",
-                    mOff, mOffReuseB, mHand, mLazyImm, mLazyReuseB));
+                    mOff, mOffReuseB, mHand, mLazyImm, mLazyReuseB, mRawLower));
         }
 
         // =====================================================================
@@ -213,8 +220,13 @@ public class LazyProtoBenchmarkSuite {
                 return (reusableLazyBuilder.getOrderId() > 0 && reusableLazyBuilder.getStatus() == 1)
                         ? reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0) : 0;
             });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, i -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length);
+                return (reusableRaw.getOrderId() > 0 && reusableRaw.getStatus() == 1)
+                        ? reusableRaw.writeToBuffer(reusableOutBuf, 0) : 0;
+            });
             trackII.add(new TrackIIRow("Advantageous (A2)", "Inspect 2 + Passthrough (FP0)",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -285,8 +297,15 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.getUserBuilder().setScore(98.75);
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length)
+                        .setStatus(2)
+                        .setUpdatedAtFixed64(1800000000000L + (iter & 0xFF));
+                reusableRaw.user().setScore(98.75);
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Advantageous (A3)", "Modify 3 Fixed/Same-Size (FP1)",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -357,8 +376,15 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.getUserBuilder().setCity("SHANGHAI_PUDONG");
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length)
+                        .setBuyerName("alexander_the_great_vip_buyer")
+                        .setStatus(50000);
+                reusableRaw.user().setCity("SHANGHAI_PUDONG");
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Advantageous (A4)", "Var-Size String + City (FP2)",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -413,8 +439,13 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.getItemsBuilder(42).setQuantity(999).setDescription("UPDATED_ITEM_42_DESC");
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length);
+                reusableRaw.items(42).setQuantity(999).setDescription("UPDATED_ITEM_42_DESC");
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Advantageous (A5)", "Mutate 1 of 100 Repeated Items",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -443,8 +474,12 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.reuse(complexBytes, 0, complexBytes.length).clearAuthToken();
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length).clearAuthToken();
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Advantageous (A6)", "Redact 1 Field + Forward",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -458,10 +493,25 @@ public class LazyProtoBenchmarkSuite {
             trackI.add(new TrackIRow("Non-Advantageous (B1)", "Build Scratch (10 items)", mOff, mHand, mLazyImm));
 
             Metric mOffOut = measure(WARMUP, ITERS, iter -> writeOfficialToBuf(buildOfficialScratch(iter, smallPayload), reusableOutBuf));
+            Metric mOffReuseBOut = measure(WARMUP, ITERS, iter -> {
+                reusableOfficialBuilder.clear();
+                populateOfficialBuilder(reusableOfficialBuilder, iter, smallPayload);
+                return writeOfficialToBuf(reusableOfficialBuilder.build(), reusableOutBuf);
+            });
             Metric mHandOut = measure(WARMUP, ITERS, iter -> writeHandEagerToBuf(buildHandScratch(iter, smallPayload), reusableOutBuf));
             Metric mLazyImmOut = measure(WARMUP, ITERS, iter -> buildLazyScratch(iter, smallPayload).writeToBuffer(reusableOutBuf, 0));
+            Metric mLazyReuseBOut = measure(WARMUP, ITERS, iter -> {
+                reusableLazyBuilder.clear();
+                populateLazyBuilder(reusableLazyBuilder, iter, smallPayload);
+                return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
+            });
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.initScratch();
+                populateRawScratch(reusableRaw, iter, smallPayload);
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Non-Advantageous (B1)", "Build Scratch (10 items)",
-                    mOffOut, mOffOut, mHandOut, mLazyImmOut, mLazyImmOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -481,8 +531,13 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.reuse(complexBytes, 0, complexBytes.length);
                 return readLazyBuilderFull(reusableLazyBuilder);
             });
+            final RawOrderEnvelope.RawLineItem tmpRawItem = new RawOrderEnvelope.RawLineItem();
+            Metric mRawLower = measure(WARMUP_H, ITERS_H, iter -> {
+                reusableRaw.wrap(complexBytes, 0, complexBytes.length);
+                return readRawFull(reusableRaw, tmpRawItem);
+            });
             trackII.add(new TrackIIRow("Non-Advantageous (B2)", "100% Full-Tree Read (no outBuf)",
-                    mOff, mOffReuseB, mHand, mLazyImm, mLazyReuseB));
+                    mOff, mOffReuseB, mHand, mLazyImm, mLazyReuseB, mRawLower));
         }
 
         // =====================================================================
@@ -508,13 +563,19 @@ public class LazyProtoBenchmarkSuite {
                 mutateLazyBuilderFull(reusableLazyBuilder, newPayload);
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
+            Metric mRawLowerOut = measure(WARMUP_H, ITERS_H, iter -> {
+                reusableRaw.wrap(mediumBytes, 0, mediumBytes.length);
+                mutateRawFull(reusableRaw, newPayload);
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
             trackII.add(new TrackIIRow("Non-Advantageous (B3)", "100% Full-Tree Var-Size Mutate",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
-        // B4: Tiny 11-Byte Message (Read All 3 + Mutate All 3 Var-Size)
+        // B4: Tiny Message (Read All 3 + Mutate All 3 Var-Size)
         // =====================================================================
+        final String b4Label = "Tiny " + tinyBytes.length + "-Byte Msg (Read+Mutate)";
         {
             Metric mOff = measure(WARMUP, ITERS, iter -> {
                 OrderEnvelope msg = OrderEnvelope.parseFrom(tinyBytes);
@@ -534,7 +595,7 @@ public class LazyProtoBenchmarkSuite {
                 return msg.toBuilder().setOrderId(sum + 100000000L).setStatus(30000).setTotalCents(999999999L)
                         .build().toByteArray().length;
             });
-            trackI.add(new TrackIRow("Non-Advantageous (B4)", "Tiny 11-Byte Msg (Read+Mutate)", mOff, mHand, mLazyImm));
+            trackI.add(new TrackIRow("Non-Advantageous (B4)", b4Label, mOff, mHand, mLazyImm));
 
             Metric mOffOut = measure(WARMUP, ITERS, iter -> {
                 OrderEnvelope msg = OrderEnvelope.parseFrom(tinyBytes);
@@ -567,8 +628,14 @@ public class LazyProtoBenchmarkSuite {
                 reusableLazyBuilder.setOrderId(sum + 100000000L).setStatus(30000).setTotalCents(999999999L);
                 return reusableLazyBuilder.writeToBuffer(reusableOutBuf, 0);
             });
-            trackII.add(new TrackIIRow("Non-Advantageous (B4)", "Tiny 11-Byte Msg (Read+Mutate)",
-                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut));
+            Metric mRawLowerOut = measure(WARMUP, ITERS, iter -> {
+                reusableRaw.wrap(tinyBytes, 0, tinyBytes.length);
+                long sum = reusableRaw.getOrderId() + reusableRaw.getStatus() + reusableRaw.getTotalCents();
+                reusableRaw.setOrderId(sum + 100000000L).setStatus(30000).setTotalCents(999999999L);
+                return reusableRaw.writeToBuffer(reusableOutBuf, 0);
+            });
+            trackII.add(new TrackIIRow("Non-Advantageous (B4)", b4Label,
+                    mOffOut, mOffReuseBOut, mHandOut, mLazyImmOut, mLazyReuseBOut, mRawLowerOut));
         }
 
         // =====================================================================
@@ -591,26 +658,27 @@ public class LazyProtoBenchmarkSuite {
                     r.officialPb().bytesPerOp(), r.handEager().bytesPerOp(), r.lazyImm().bytesPerOp());
         }
 
-        System.out.println("\n==========================================================================================================================================================");
-        System.out.println("  JAVA TRACK II (Preallocated Output Buffer Reuse + Immutable vs Reusable Builder): Official protoc 3.25.5 vs Hand-Eager vs Lazy-Proto v3");
-        System.out.println("==========================================================================================================================================================");
-        System.out.printf("%-21s | %-30s | %9s | %9s | %9s | %9s | %9s | %8s | %8s | %8s | %8s | %8s%n",
-                "Category", "Workload Scenario", "OffImm", "OffRseB", "HandEgr", "LazyImm", "LazyRseB",
-                "ImmSpd", "RseSpd", "OffR(B)", "LzIm(B)", "LzRs(B)");
-        System.out.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
+        System.out.println("\n====================================================================================================================================================================================");
+        System.out.println("  JAVA TRACK II (Preallocated Output Buffer Reuse: Compat Imm/ReuseB vs Lower-Level RawOrderEnvelope): Official protoc 3.25.5 vs Hand-Eager vs Lazy-Proto");
+        System.out.println("====================================================================================================================================================================================");
+        System.out.printf("%-21s | %-30s | %8s | %8s | %8s | %8s | %8s | %8s | %7s | %7s | %7s | %7s | %7s | %7s%n",
+                "Category", "Workload Scenario", "OffImm", "OffRseB", "HandEgr", "LazyImm", "LazyRseB", "RawLowr",
+                "ImmSpd", "RseSpd", "RawSpd", "OffR(B)", "LzRs(B)", "Raw(B)");
+        System.out.println("------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------");
         for (TrackIIRow r : trackII) {
-            System.out.printf("%-21s | %-30s | %9.1f | %9.1f | %9.1f | %9.1f | %9.1f | %7.2fx | %7.2fx | %8d | %8d | %8d%n",
+            System.out.printf("%-21s | %-30s | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %8.1f | %6.2fx | %6.2fx | %6.2fx | %7d | %7d | %7d%n",
                     r.category(), r.name(),
                     r.officialImmOutBuf().nsPerOp(), r.officialReuseBuilderOutBuf().nsPerOp(),
                     r.handEagerOutBuf().nsPerOp(),
-                    r.lazyImmOutBuf().nsPerOp(), r.lazyReuseBuilderOutBuf().nsPerOp(),
+                    r.lazyImmOutBuf().nsPerOp(), r.lazyReuseBuilderOutBuf().nsPerOp(), r.rawLowerOutBuf().nsPerOp(),
                     r.officialImmOutBuf().nsPerOp() / r.lazyImmOutBuf().nsPerOp(),
                     r.officialReuseBuilderOutBuf().nsPerOp() / r.lazyReuseBuilderOutBuf().nsPerOp(),
+                    r.officialReuseBuilderOutBuf().nsPerOp() / r.rawLowerOutBuf().nsPerOp(),
                     r.officialReuseBuilderOutBuf().bytesPerOp(),
-                    r.lazyImmOutBuf().bytesPerOp(),
-                    r.lazyReuseBuilderOutBuf().bytesPerOp());
+                    r.lazyReuseBuilderOutBuf().bytesPerOp(),
+                    r.rawLowerOutBuf().bytesPerOp());
         }
-        System.out.println("==========================================================================================================================================================\n");
+        System.out.println("====================================================================================================================================================================================\n");
 
         // Sanity assertions against real Official protoc 3.25.5 PB under same Track I / Track II rules
         assertTrue(trackI.get(0).officialPb().nsPerOp() / trackI.get(0).lazyImm().nsPerOp() > 3.0, "A1 Partial Read vs Official PB > 3x");
@@ -619,24 +687,33 @@ public class LazyProtoBenchmarkSuite {
         assertTrue(trackII.get(2).officialReuseBuilderOutBuf().nsPerOp() / trackII.get(2).lazyReuseBuilderOutBuf().nsPerOp() > 8.0, "A3 FP1 Reuse vs Official PB > 8x");
     }
 
-    private static OrderEnvelope buildOfficialScratch(int iter, byte[] payload) {
-        OrderEnvelope.Builder b = OrderEnvelope.newBuilder()
-                .setOrderId(202611240001L + iter)
+    private static final String[] SKU_TABLE = {
+            "SKU-000", "SKU-001", "SKU-002", "SKU-003", "SKU-004",
+            "SKU-005", "SKU-006", "SKU-007", "SKU-008", "SKU-009"
+    };
+
+    private static void populateOfficialBuilder(OrderEnvelope.Builder b, int iter, byte[] payload) {
+        b.setOrderId(202611240001L + iter)
                 .setBuyerName("scratch_buyer")
                 .setStatus(1)
                 .setUpdatedAtFixed64(1795497000123L)
-                .setUser(UserProfile.newBuilder()
-                        .setUserId(88001122L).setCity("SHANGHAI").setVipLevel(3)
-                        .setScore(95.5).setEmail("alice@example.com").build())
                 .setPayload(ByteString.copyFrom(payload))
                 .setAuthToken("token-123456")
                 .setTraceId("trace-123456")
                 .setTotalCents(99000L);
+        b.getUserBuilder()
+                .setUserId(88001122L).setCity("SHANGHAI").setVipLevel(3)
+                .setScore(95.5).setEmail("alice@example.com");
         for (int i = 0; i < 10; i++) {
-            b.addItems(LineItem.newBuilder()
-                    .setItemId(100L + i).setSku("SKU-00" + i).setQuantity(2)
-                    .setPriceCents(1500L).setDescription("Item desc").build());
+            b.addItemsBuilder()
+                    .setItemId(100L + i).setSku(SKU_TABLE[i]).setQuantity(2)
+                    .setPriceCents(1500L).setDescription("Item desc");
         }
+    }
+
+    private static OrderEnvelope buildOfficialScratch(int iter, byte[] payload) {
+        OrderEnvelope.Builder b = OrderEnvelope.newBuilder();
+        populateOfficialBuilder(b, iter, payload);
         return b.build();
     }
 
@@ -655,31 +732,54 @@ public class LazyProtoBenchmarkSuite {
                 .setTotalCents(99000L);
         for (int i = 0; i < 10; i++) {
             b.addItems(StandardOrderProto.LineItem.newBuilder()
-                    .setItemId(100L + i).setSku("SKU-00" + i).setQuantity(2)
+                    .setItemId(100L + i).setSku(SKU_TABLE[i]).setQuantity(2)
                     .setPriceCents(1500L).setDescription("Item desc").build());
         }
         return b.build();
     }
 
-    private static LazyOrderEnvelope buildLazyScratch(int iter, byte[] payload) {
-        LazyOrderEnvelope.Builder b = LazyOrderEnvelope.newBuilder()
-                .setOrderId(202611240001L + iter)
+    private static void populateLazyBuilder(LazyOrderEnvelope.Builder b, int iter, byte[] payload) {
+        b.setOrderId(202611240001L + iter)
                 .setBuyerName("scratch_buyer")
                 .setStatus(1)
                 .setUpdatedAtFixed64(1795497000123L)
-                .setUser(LazyUserProfile.newBuilder()
-                        .setUserId(88001122L).setCity("SHANGHAI").setVipLevel(3)
-                        .setScore(95.5).setEmail("alice@example.com").build())
                 .setPayloadBytes(payload)
                 .setAuthToken("token-123456")
                 .setTraceId("trace-123456")
                 .setTotalCents(99000L);
+        b.getUserBuilder()
+                .setUserId(88001122L).setCity("SHANGHAI").setVipLevel(3)
+                .setScore(95.5).setEmail("alice@example.com");
         for (int i = 0; i < 10; i++) {
-            b.addItems(LazyLineItem.newBuilder()
-                    .setItemId(100L + i).setSku("SKU-00" + i).setQuantity(2)
-                    .setPriceCents(1500L).setDescription("Item desc").build());
+            b.addItemsBuilder()
+                    .setItemId(100L + i).setSku(SKU_TABLE[i]).setQuantity(2)
+                    .setPriceCents(1500L).setDescription("Item desc");
         }
+    }
+
+    private static LazyOrderEnvelope buildLazyScratch(int iter, byte[] payload) {
+        LazyOrderEnvelope.Builder b = LazyOrderEnvelope.newBuilder();
+        populateLazyBuilder(b, iter, payload);
         return b.build();
+    }
+
+    private static void populateRawScratch(RawOrderEnvelope raw, int iter, byte[] payload) {
+        raw.setOrderId(202611240001L + iter)
+                .setBuyerName("scratch_buyer")
+                .setStatus(1)
+                .setUpdatedAtFixed64(1795497000123L)
+                .setPayloadBytes(payload)
+                .setAuthToken("token-123456")
+                .setTraceId("trace-123456")
+                .setTotalCents(99000L);
+        raw.user()
+                .setUserId(88001122L).setCity("SHANGHAI").setVipLevel(3)
+                .setScore(95.5).setEmail("alice@example.com");
+        for (int i = 0; i < 10; i++) {
+            raw.addItem()
+                    .setItemId(100L + i).setSku(SKU_TABLE[i]).setQuantity(2)
+                    .setPriceCents(1500L).setDescription("Item desc");
+        }
     }
 
     private static long readOfficialFull(OrderEnvelope msg) {
@@ -830,6 +930,41 @@ public class LazyProtoBenchmarkSuite {
         int cnt = b.getItemsCount();
         for (int i = 0; i < cnt; i++) {
             b.getItemsBuilder(i)
+                    .setItemId(9000000L + i).setSku("NEW-LONG-SKU-CODE-" + i)
+                    .setQuantity(50000).setPriceCents(10L).setDescription("Short");
+        }
+    }
+
+    private static long readRawFull(RawOrderEnvelope msg, RawOrderEnvelope.RawLineItem tmp) {
+        long sum = msg.getOrderId() + msg.getBuyerName().length() + msg.getStatus()
+                + msg.getUpdatedAtFixed64() + msg.getPayloadLength()
+                + msg.getAuthToken().length() + msg.getTraceId().length() + msg.getTotalCents();
+        var u = msg.user();
+        sum += u.getUserId() + u.getCity().length() + u.getVipLevel()
+                + (long) u.getScore() + u.getEmail().length();
+        int n = msg.getItemsCount();
+        for (int i = 0; i < n; i++) {
+            msg.readItemEager(i, tmp);
+            sum += tmp.itemId + tmp.skuLen + tmp.quantity + tmp.priceCents + tmp.descLen;
+        }
+        return sum;
+    }
+
+    private static void mutateRawFull(RawOrderEnvelope raw, byte[] newPayload) {
+        raw.setOrderId(1L)
+                .setBuyerName("mutated_full_tree_buyer_name_long")
+                .setStatus(99999)
+                .setUpdatedAtFixed64(42L)
+                .setPayloadBytes(newPayload)
+                .setAuthToken("new_short_tok")
+                .setTraceId("new_trace_id_full_mutation_long_string")
+                .setTotalCents(5L);
+        raw.user()
+                .setUserId(2L).setCity("GUANGZHOU_FULL_MUTATE")
+                .setVipLevel(10000).setScore(12.34).setEmail("full_mutate_user@example.org");
+        int cnt = raw.getItemsCount();
+        for (int i = 0; i < cnt; i++) {
+            raw.items(i)
                     .setItemId(9000000L + i).setSku("NEW-LONG-SKU-CODE-" + i)
                     .setQuantity(50000).setPriceCents(10L).setDescription("Short");
         }

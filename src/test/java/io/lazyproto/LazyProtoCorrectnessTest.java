@@ -4,6 +4,8 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnknownFieldSet;
+import io.lazyproto.core.RawOrderEnvelope;
+import io.lazyproto.core.RawWireView;
 import io.lazyproto.dynamic.ProtoDocument;
 import io.lazyproto.model.LazyOrderProto.LazyLineItem;
 import io.lazyproto.model.LazyOrderProto.LazyOrderEnvelope;
@@ -723,5 +725,72 @@ public class LazyProtoCorrectnessTest {
         io.lazyproto.bench.proto.OrderEnvelope offFromLazy =
                 io.lazyproto.bench.proto.OrderEnvelope.parseFrom(lazyWire);
         assertEquals(offMutated, offFromLazy);
+    }
+
+    @Test
+    @DisplayName("F1: Java Lower-Level RawOrderEnvelope & RawWireView correctness vs Official protoc")
+    void testF1_JavaLowerLevelRawOrderAndWireView() throws IOException {
+        byte[] raw = createComplexOrderBytes(100, 4096);
+        byte[] outBuf = new byte[raw.length + 4096];
+
+        // 1. RawOrderEnvelope: partial read + FP0 + FP1 + FP2 + item edit + redact + scratch
+        RawOrderEnvelope rawEnv = new RawOrderEnvelope().wrap(raw, 0, raw.length);
+        assertFalse(rawEnv.isScanned());
+        assertEquals(202611240001L, rawEnv.getOrderId());
+        assertEquals(3, rawEnv.user().getVipLevel());
+        assertTrue(rawEnv.isClean());
+        int fp0Len = rawEnv.writeToBuffer(outBuf, 0);
+        assertEquals(raw.length, fp0Len);
+        assertArrayEquals(raw, Arrays.copyOf(outBuf, fp0Len));
+
+        // FP1
+        rawEnv.setStatus(2).setUpdatedAtFixed64(1800000000999L);
+        rawEnv.user().setScore(98.75);
+        assertTrue(rawEnv.isSameSizeDirtyOnly());
+        int fp1Len = rawEnv.writeToBuffer(outBuf, 0);
+        assertEquals(raw.length, fp1Len);
+        io.lazyproto.bench.proto.OrderEnvelope fp1Decoded =
+                io.lazyproto.bench.proto.OrderEnvelope.parseFrom(Arrays.copyOf(outBuf, fp1Len));
+        assertEquals(2, fp1Decoded.getStatus());
+        assertEquals(98.75, fp1Decoded.getUser().getScore());
+
+        // FP2 + item #42 + redact
+        rawEnv.wrap(raw, 0, raw.length);
+        rawEnv.setBuyerName("raw_lower_level_buyer_name");
+        rawEnv.user().setCity("HANGZHOU_RAW");
+        rawEnv.items(42).setQuantity(999).setDescription("RAW_UPDATED_42");
+        rawEnv.clearAuthToken();
+        int fp2Len = rawEnv.writeToBuffer(outBuf, 0);
+        io.lazyproto.bench.proto.OrderEnvelope fp2Decoded =
+                io.lazyproto.bench.proto.OrderEnvelope.parseFrom(Arrays.copyOf(outBuf, fp2Len));
+        assertEquals("raw_lower_level_buyer_name", fp2Decoded.getBuyerName());
+        assertEquals("HANGZHOU_RAW", fp2Decoded.getUser().getCity());
+        assertEquals(999, fp2Decoded.getItems(42).getQuantity());
+        assertEquals("RAW_UPDATED_42", fp2Decoded.getItems(42).getDescription());
+        assertEquals("", fp2Decoded.getAuthToken());
+        assertTrue(fp2Decoded.getUnknownFields().hasField(50));
+        assertTrue(fp2Decoded.getUnknownFields().hasField(51));
+
+        // 2. RawWireView: generic dynamic Input-Bytes Wrapper
+        RawWireView view = new RawWireView().wrap(raw, 0, raw.length);
+        assertFalse(view.isScanned());
+        assertEquals(202611240001L, view.getInt64(1));
+        assertEquals("SH", view.sub(5).getString(2));
+        assertEquals(9876543210L, view.getInt64(50));
+        assertEquals(100, view.repeatedCount(6));
+        assertEquals("SKU-PRO-0042", view.repeatedSub(6, 42).getString(2));
+
+        view.setString(2, "raw_wire_view_buyer");
+        view.sub(5).setString(2, "SHANGHAI_WIRE_VIEW");
+        view.repeatedSub(6, 42).setInt32(3, 555);
+        view.erase(8);
+        int viewLen = view.writeToBuffer(outBuf, 0);
+        io.lazyproto.bench.proto.OrderEnvelope viewDecoded =
+                io.lazyproto.bench.proto.OrderEnvelope.parseFrom(Arrays.copyOf(outBuf, viewLen));
+        assertEquals("raw_wire_view_buyer", viewDecoded.getBuyerName());
+        assertEquals("SHANGHAI_WIRE_VIEW", viewDecoded.getUser().getCity());
+        assertEquals(555, viewDecoded.getItems(42).getQuantity());
+        assertEquals("", viewDecoded.getAuthToken());
+        assertTrue(viewDecoded.getUnknownFields().hasField(50));
     }
 }
