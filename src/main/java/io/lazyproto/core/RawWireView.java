@@ -77,6 +77,7 @@ public final class RawWireView {
     private RawWireView parent;
     private int parentFieldNumber;
     private int parentRepIdx = -1;
+    private int parentEpoch = -1;
     private final Utf8Slice reusableSlice = new Utf8Slice();
     private WireWriter cachedWriter;
     private final WireTape.ScanVisitor scanVisitor = this::onScanField;
@@ -106,11 +107,36 @@ public final class RawWireView {
         return this;
     }
 
+    private static void detachChild(RawWireView child) {
+        if (child != null) {
+            child.parent = null;
+            child.parentEpoch = -1;
+        }
+    }
+
+    private static void detachRepSubViews(FieldSlot fc) {
+        if (fc.repSubViews != null && fc.repCount > 0) {
+            for (int r = 0; r < fc.repCount; r++) {
+                if (fc.repSubViews[r] != null) {
+                    detachChild(fc.repSubViews[r]);
+                    fc.repSubViews[r] = null;
+                }
+            }
+        }
+        if (fc.repSubEpochs != null && fc.repCount > 0) {
+            Arrays.fill(fc.repSubEpochs, 0, fc.repCount, -1);
+        }
+    }
+
     private void resetLocal() {
         wrapEpoch++;
         Arrays.fill(directSlot, -1);
         for (int i = 0; i < slotCount; i++) {
             FieldSlot s = slots[i];
+            detachChild(s.subView);
+            s.subView = null;
+            s.subViewEpoch = -1;
+            detachRepSubViews(s);
             s.lastTapeIdx = -1;
             s.present = false;
             s.decoded = false;
@@ -124,10 +150,6 @@ public final class RawWireView {
             s.kind = KIND_NONE;
             s.extBytes = null;
             s.stringCache = null;
-            s.subViewEpoch = -1;
-            if (s.repSubViews != null && s.repCount > 0) {
-                Arrays.fill(s.repSubViews, 0, s.repCount, null);
-            }
             s.repCount = 0;
             s.repDirtyCount = 0;
         }
@@ -269,7 +291,8 @@ public final class RawWireView {
                             ScratchUtf8Arena.unpackOffset(fc.arenaHandle),
                             ScratchUtf8Arena.unpackLength(fc.arenaHandle));
                 } else {
-                    fc.stringCache = WireReader.readStringAt(fc.extBytes, fc.extOff, fc.extLen);
+                    fc.stringCache = WireReader.readStringAt(
+                            fc.extBytes != null ? fc.extBytes : WireTape.EMPTY_BYTES, fc.extOff, fc.extLen);
                 }
             }
             return fc.stringCache;
@@ -317,6 +340,7 @@ public final class RawWireView {
             child.parent = this;
             child.parentFieldNumber = fn;
             child.parentRepIdx = -1;
+            child.parentEpoch = this.wrapEpoch;
             fc.subViewEpoch = this.wrapEpoch;
             if (!fc.bytesOverride) {
                 fc.kind = KIND_SUBVIEW;
@@ -366,6 +390,7 @@ public final class RawWireView {
             child.parent = this;
             child.parentFieldNumber = fn;
             child.parentRepIdx = repIndex;
+            child.parentEpoch = this.wrapEpoch;
             fc.repSubEpochs[repIndex] = this.wrapEpoch;
         }
         return child;
@@ -455,20 +480,34 @@ public final class RawWireView {
         return this;
     }
 
+    private void clearRepeatedDirtyCounts(FieldSlot fc) {
+        if (fc.repDirtyCount > 0) {
+            for (int i = 0; i < fc.repCount; i++) {
+                int tIdx = fc.repTapeIdx[i];
+                int f = tape.flags(tIdx);
+                if (f == WireTape.FLAG_DIRTY_SAME_SIZE) {
+                    sameSizeDirtyCount--;
+                    tape.setFlags(tIdx, WireTape.FLAG_CLEAN_RAW);
+                } else if (f == WireTape.FLAG_DIRTY_VAR_SIZE) {
+                    varSizeDirtyCount--;
+                    tape.setFlags(tIdx, WireTape.FLAG_CLEAN_RAW);
+                }
+            }
+            fc.repDirtyCount = 0;
+        }
+    }
+
     private void invalidateChildViews(FieldSlot fc) {
+        clearRepeatedDirtyCounts(fc);
+        detachChild(fc.subView);
+        fc.subView = null;
         fc.subViewEpoch = -1;
         fc.subDirty = false;
         fc.bytesOverride = false;
         fc.bytesInArena = false;
         fc.extBytes = null;
         fc.stringCache = null;
-        if (fc.repSubViews != null && fc.repCount > 0) {
-            Arrays.fill(fc.repSubViews, 0, fc.repCount, null);
-        }
-        if (fc.repSubEpochs != null && fc.repCount > 0) {
-            Arrays.fill(fc.repSubEpochs, 0, fc.repCount, -1);
-        }
-        fc.repDirtyCount = 0;
+        detachRepSubViews(fc);
     }
 
     private void wrapMultiSegments(WireTape parentTape, int[] segIndices, int segCount) {
@@ -491,6 +530,7 @@ public final class RawWireView {
         if (fc.sameSizeDirty) { sameSizeDirtyCount--; fc.sameSizeDirty = false; }
         if (fc.varSizeDirty) { varSizeDirtyCount--; fc.varSizeDirty = false; }
         if (fc.appended) { appendedCount--; fc.appended = false; }
+        clearRepeatedDirtyCounts(fc);
     }
 
     private void markScalarDirty(FieldSlot fc, int expectedWt, int newValLen) {
@@ -499,7 +539,9 @@ public final class RawWireView {
             for (int i = 0; i < fc.repCount - 1; i++) {
                 tape.setFlags(fc.repTapeIdx[i], WireTape.FLAG_SHADOWED);
             }
-            if (tape.wireType(fc.lastTapeIdx) == expectedWt && tape.valueLength(fc.lastTapeIdx) == newValLen) {
+            if (fc.repCount == 1
+                    && tape.wireType(fc.lastTapeIdx) == expectedWt
+                    && tape.valueLength(fc.lastTapeIdx) == newValLen) {
                 tape.setFlags(fc.lastTapeIdx, WireTape.FLAG_DIRTY_SAME_SIZE);
                 fc.sameSizeDirty = true;
                 sameSizeDirtyCount++;
@@ -519,8 +561,33 @@ public final class RawWireView {
     }
 
     private void onChildDirty(int fn, int repIdx, RawWireView child) {
-        FieldSlot fc = findOrCreateSlot(fn);
+        if (child.parent != this || child.parentEpoch != this.wrapEpoch) return;
+        int idx = findSlotIdx(fn);
+        if (idx < 0) return;
+        FieldSlot fc = slots[idx];
         if (repIdx >= 0) {
+            if (repIdx >= fc.repCount || fc.repSubViews == null || repIdx >= fc.repSubViews.length
+                    || fc.repSubViews[repIdx] != child
+                    || (fc.repSubEpochs != null && fc.repSubEpochs[repIdx] != this.wrapEpoch)) {
+                return;
+            }
+            if (fc.sameSizeDirty || fc.varSizeDirty || fc.appended || fc.subDirty || fc.bytesOverride) {
+                if (fc.sameSizeDirty) { sameSizeDirtyCount--; fc.sameSizeDirty = false; }
+                if (fc.varSizeDirty) { varSizeDirtyCount--; fc.varSizeDirty = false; }
+                if (fc.appended) { appendedCount--; fc.appended = false; }
+                detachChild(fc.subView);
+                fc.subView = null;
+                fc.subViewEpoch = -1;
+                fc.subDirty = false;
+                fc.bytesOverride = false;
+                fc.bytesInArena = false;
+                fc.extBytes = null;
+                fc.stringCache = null;
+                for (int i = 0; i < fc.repCount; i++) {
+                    tape.setFlags(fc.repTapeIdx[i], WireTape.FLAG_CLEAN_RAW);
+                }
+                fc.repDirtyCount = 0;
+            }
             int tIdx = fc.repTapeIdx[repIdx];
             int prev = tape.flags(tIdx);
             if (prev == WireTape.FLAG_DIRTY_SAME_SIZE) sameSizeDirtyCount--;
@@ -534,13 +601,17 @@ public final class RawWireView {
                 varSizeDirtyCount++;
             }
         } else {
+            if (fc.subView != child || fc.subViewEpoch != this.wrapEpoch) {
+                return;
+            }
+            clearDirtyCounts(fc);
+            detachRepSubViews(fc);
             fc.subDirty = true;
             fc.bytesOverride = false;
             fc.kind = KIND_SUBVIEW;
             fc.decoded = true;
             fc.present = true;
             fc.deleted = false;
-            clearDirtyCounts(fc);
             if (fc.repCount > 0) {
                 for (int i = 0; i < fc.repCount - 1; i++) tape.setFlags(fc.repTapeIdx[i], WireTape.FLAG_SHADOWED);
                 int tail = fc.repTapeIdx[fc.repCount - 1];

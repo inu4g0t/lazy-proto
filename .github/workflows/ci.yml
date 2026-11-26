@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Run Maven test suite
+        run: mvn -B test
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protobuf toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      - name: Build and test C++ (ASan + UBSan)
+        run: |
+          make -C cpp clean
+          make -C cpp test CXXFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++20 -Wall -Wextra"
+      - name: Build and test C++ (Release -O3 -DNDEBUG)
+        run: |
+          make -C cpp clean
+          make -C cpp test CXXFLAGS="-O3 -DNDEBUG -std=c++20 -Wall -Wextra"
