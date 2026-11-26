@@ -6,9 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/unknown_field_set.h>
 #include <new>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,9 +30,19 @@ namespace pb = lazyproto::bench;
 
 // ============================================================================
 // Global Heap Allocation Counter (tracks malloc/new bytes across C++ & libprotobuf)
+// Disabled under ASan so ASan's own allocator/mismatch interceptors stay active.
 // ============================================================================
 static thread_local uint64_t g_thread_alloc_bytes = 0;
 
+#if defined(__SANITIZE_ADDRESS__)
+#define LP_ASAN_ENABLED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define LP_ASAN_ENABLED 1
+#endif
+#endif
+
+#if !defined(LP_ASAN_ENABLED)
 __attribute__((noinline)) void* operator new(std::size_t size) {
     g_thread_alloc_bytes += size;
     void* p = std::malloc(size);
@@ -57,6 +69,7 @@ __attribute__((noinline)) void operator delete[](void* p) noexcept {
 __attribute__((noinline)) void operator delete[](void* p, std::size_t) noexcept {
     std::free(p);
 }
+#endif
 
 // ============================================================================
 // Symmetric Output Keep-Alive (Prevents DCE/DSE on Both Official & Lazy Outputs)
@@ -479,6 +492,702 @@ void run_correctness_tests() {
         LP_CHECK(pb_decoded.items_size() == 10);
     }
 
+    // 8. Lower-Level Bug Regressions (Multi-Entry FP1 Shadow, repeated_sub Counter Leak, Child Detach, read_item_eager)
+    {
+        // Bug 1a: Split submessage (2a 02 08 01 2a 02 18 02) + same-size set_bytes(5, {0x08, 0x09})
+        {
+            const uint8_t split_user[] = {0x2A, 0x02, 0x08, 0x01, 0x2A, 0x02, 0x18, 0x02};
+            WireView wv(split_user, sizeof(split_user));
+            const char repl[] = {'\x08', '\x09'};
+            wv.set_bytes(5, std::string_view(repl, 2));
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            std::string out;
+            wv.merge_to(out);
+            LP_CHECK(out.size() == 4);
+            LP_CHECK(static_cast<uint8_t>(out[0]) == 0x2A && static_cast<uint8_t>(out[1]) == 0x02
+                  && static_cast<uint8_t>(out[2]) == 0x08 && static_cast<uint8_t>(out[3]) == 0x09);
+            pb::OrderEnvelope dec;
+            LP_CHECK(dec.ParseFromArray(out.data(), static_cast<int>(out.size())));
+            LP_CHECK(dec.user().user_id() == 9);
+            LP_CHECK(dec.user().vip_level() == 0);
+        }
+
+        // Bug 1b: Repeated field (32 02 18 01 32 02 18 02) + same-size set_bytes(6, {0x18, 0x09})
+        {
+            const uint8_t two_items[] = {0x32, 0x02, 0x18, 0x01, 0x32, 0x02, 0x18, 0x02};
+            WireView wv(two_items, sizeof(two_items));
+            const char repl[] = {'\x18', '\x09'};
+            wv.set_bytes(6, std::string_view(repl, 2));
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            std::string out;
+            wv.merge_to(out);
+            LP_CHECK(out.size() == 4);
+            LP_CHECK(static_cast<uint8_t>(out[0]) == 0x32 && static_cast<uint8_t>(out[1]) == 0x02
+                  && static_cast<uint8_t>(out[2]) == 0x18 && static_cast<uint8_t>(out[3]) == 0x09);
+            pb::OrderEnvelope dec;
+            LP_CHECK(dec.ParseFromArray(out.data(), static_cast<int>(out.size())));
+            LP_CHECK(dec.items_size() == 1 && dec.items(0).quantity() == 9);
+        }
+
+        // Bug 1c: Duplicate scalar (08 01 08 02) + same-size set_varint(1, 5)
+        {
+            const uint8_t dup_scalar[] = {0x08, 0x01, 0x08, 0x02};
+            WireView wv(dup_scalar, sizeof(dup_scalar));
+            wv.set_varint(1, 5);
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            std::string out;
+            wv.merge_to(out);
+            LP_CHECK(out.size() == 2 && static_cast<uint8_t>(out[0]) == 0x08 && static_cast<uint8_t>(out[1]) == 0x05);
+        }
+
+        // Bug 2: repeated_sub mutate -> set_bytes / set_varint / erase dirty-counter leak check
+        {
+            const uint8_t one_item[] = {0x32, 0x02, 0x18, 0x01};
+            WireView wv(one_item, sizeof(one_item));
+            wv.repeated_sub(6, 0).set_int32(3, 500); // var_size_dirty_count_ = 1
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            const char same_repl[] = {'\x18', '\x09'};
+            wv.set_bytes(6, std::string_view(same_repl, 2)); // must decrement leaked var_size_dirty_count_!
+            LP_CHECK(wv.is_same_size_dirty_only());
+            std::string out1;
+            wv.merge_to(out1);
+            LP_CHECK(out1.size() == 4
+                  && static_cast<uint8_t>(out1[0]) == 0x32 && static_cast<uint8_t>(out1[1]) == 0x02
+                  && static_cast<uint8_t>(out1[2]) == 0x18 && static_cast<uint8_t>(out1[3]) == 0x09);
+
+            const uint8_t two_items[] = {0x32, 0x02, 0x18, 0x01, 0x32, 0x02, 0x18, 0x02};
+            wv.wrap(two_items, sizeof(two_items));
+            wv.repeated_sub(6, 0).set_int32(3, 5);
+            wv.repeated_sub(6, 1).set_int32(3, 500);
+            wv.set_bytes(6, std::string_view(same_repl, 2));
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            std::string out2;
+            wv.merge_to(out2);
+            LP_CHECK(out2.size() == 4 && static_cast<uint8_t>(out2[3]) == 0x09);
+            wv.erase(6);
+            std::string out_empty;
+            wv.merge_to(out_empty);
+            LP_CHECK(out_empty.empty());
+
+            const uint8_t item_and_order[] = {0x08, 0x01, 0x32, 0x02, 0x18, 0x01};
+            wv.wrap(item_and_order, sizeof(item_and_order));
+            wv.repeated_sub(6, 0).set_int32(3, 5);
+            LP_CHECK(wv.is_same_size_dirty_only());
+            wv.erase(6);
+            LP_CHECK(!wv.is_same_size_dirty_only());
+            std::string out3;
+            wv.merge_to(out3);
+            LP_CHECK(out3.size() == 2 && static_cast<uint8_t>(out3[0]) == 0x08 && static_cast<uint8_t>(out3[1]) == 0x01);
+        }
+
+        // Bug 3: Stale child view detachment after wrap(), set_bytes(), erase()
+        {
+            const uint8_t msg1[] = {0x2A, 0x02, 0x08, 0x01, 0x32, 0x02, 0x18, 0x01};
+            const uint8_t msg2[] = {0x2A, 0x02, 0x08, 0x02, 0x32, 0x02, 0x18, 0x02};
+            WireView wv(msg1, sizeof(msg1));
+            WireView& stale_sub = wv.sub(5);
+            WireView& stale_rep = wv.repeated_sub(6, 0);
+            WireView& stale_grand = stale_sub.sub(2);
+
+            wv.wrap(msg2, sizeof(msg2));
+            stale_sub.set_varint(1, 999);
+            const uint8_t repl_u[] = {0x08, 0x77};
+            stale_sub.wrap(repl_u, sizeof(repl_u));
+            stale_rep.set_int32(3, 888);
+            const uint8_t repl_i[] = {0x18, 0x66};
+            stale_rep.wrap(repl_i, sizeof(repl_i));
+            stale_grand.set_varint(1, 777);
+
+            LP_CHECK(wv.is_clean());
+            std::string out_clean;
+            wv.merge_to(out_clean);
+            LP_CHECK(out_clean.size() == sizeof(msg2) && std::memcmp(out_clean.data(), msg2, sizeof(msg2)) == 0);
+
+            WireView& stale_sub2 = wv.sub(5);
+            WireView& stale_rep2 = wv.repeated_sub(6, 0);
+            const char new_u[] = {'\x08', '\x07'};
+            wv.set_bytes(5, std::string_view(new_u, 2));
+            wv.erase(6);
+            stale_sub2.set_varint(1, 555);
+            stale_rep2.set_int32(3, 444);
+
+            std::string out_override;
+            wv.merge_to(out_override);
+            pb::OrderEnvelope dec;
+            LP_CHECK(dec.ParseFromArray(out_override.data(), static_cast<int>(out_override.size())));
+            LP_CHECK(dec.user().user_id() == 7);
+            LP_CHECK(dec.items_size() == 0);
+        }
+
+        // Bug 4: OrderEnvelopeView.wrap() -> read_item_eager(0, out) directly without calling items_count() first
+        {
+            pb::OrderEnvelope src;
+            src.set_order_id(77);
+            auto* it0 = src.add_items();
+            it0->set_item_id(101);
+            it0->set_sku("SKU-DIRECT");
+            it0->set_quantity(4);
+            it0->set_price_cents(2500);
+            it0->set_description("Direct eager read");
+            src.add_items(); // empty second item
+            std::string wire;
+            LP_CHECK(src.SerializeToString(&wire));
+
+            OrderEnvelopeView env;
+            env.wrap(reinterpret_cast<const uint8_t*>(wire.data()), 0, static_cast<uint32_t>(wire.size()));
+            LP_CHECK(!env.scanned_);
+            LineItemView out_item;
+            env.read_item_eager(0, out_item);
+            LP_CHECK(env.scanned_);
+            LP_CHECK(out_item.item_id_ == 101ULL);
+            LP_CHECK(out_item.sku_ == "SKU-DIRECT");
+            LP_CHECK(out_item.quantity_ == 4);
+            LP_CHECK(out_item.price_cents_ == 2500ULL);
+            LP_CHECK(out_item.description_ == "Direct eager read");
+
+            // Reading empty item into reused out_item must reset previous values
+            env.read_item_eager(1, out_item);
+            LP_CHECK(out_item.item_id_ == 0ULL);
+            LP_CHECK(out_item.sku_.empty());
+            LP_CHECK(out_item.quantity_ == 0);
+            LP_CHECK(out_item.price_cents_ == 0ULL);
+            LP_CHECK(out_item.description_.empty());
+        }
+    }
+
+    // 9. Stateful Random Differential Fuzzing for WireView & OrderEnvelopeView
+    {
+        auto assert_pb_equal = [](const pb::OrderEnvelope& expected, const pb::OrderEnvelope& actual) {
+            LP_CHECK(expected.order_id() == actual.order_id());
+            LP_CHECK(expected.buyer_name() == actual.buyer_name());
+            LP_CHECK(expected.status() == actual.status());
+            LP_CHECK(expected.updated_at_fixed64() == actual.updated_at_fixed64());
+            LP_CHECK(expected.has_user() == actual.has_user());
+            if (expected.has_user()) {
+                LP_CHECK(expected.user().user_id() == actual.user().user_id());
+                LP_CHECK(expected.user().city() == actual.user().city());
+                LP_CHECK(expected.user().vip_level() == actual.user().vip_level());
+                uint64_t eb = 0, ab = 0;
+                double es = expected.user().score(), as = actual.user().score();
+                std::memcpy(&eb, &es, 8);
+                std::memcpy(&ab, &as, 8);
+                LP_CHECK(eb == ab);
+                LP_CHECK(expected.user().email() == actual.user().email());
+            }
+            LP_CHECK(expected.items_size() == actual.items_size());
+            for (int i = 0; i < expected.items_size(); i++) {
+                const auto& ei = expected.items(i);
+                const auto& ai = actual.items(i);
+                LP_CHECK(ei.item_id() == ai.item_id());
+                LP_CHECK(ei.sku() == ai.sku());
+                LP_CHECK(ei.quantity() == ai.quantity());
+                LP_CHECK(ei.price_cents() == ai.price_cents());
+                LP_CHECK(ei.description() == ai.description());
+            }
+            LP_CHECK(expected.payload() == actual.payload());
+            LP_CHECK(expected.auth_token() == actual.auth_token());
+            LP_CHECK(expected.trace_id() == actual.trace_id());
+            LP_CHECK(expected.total_cents() == actual.total_cents());
+            const auto& eu = expected.GetReflection()->GetUnknownFields(expected);
+            const auto& au = actual.GetReflection()->GetUnknownFields(actual);
+            LP_CHECK(eu.field_count() == au.field_count());
+        };
+
+        const std::vector<std::string> sample_strings = {
+            "", "A", "SH", "BJ", "NYC", "SKU-1", "Shanghai", "SanFrancisco-CA",
+            "Hangzhou-UTF8-Test", std::string(140, 'x')
+        };
+        const uint64_t sample_varints[] = {
+            0ULL, 1ULL, 2ULL, 7ULL, 127ULL, 128ULL, 255ULL, 16383ULL, 16384ULL,
+            (1ULL << 21) + 5ULL, (1ULL << 35) + 11ULL, 0x7FFFFFFFFFFFFFFFULL
+        };
+        constexpr size_t num_varints = sizeof(sample_varints) / sizeof(sample_varints[0]);
+
+        auto make_random_wire = [&](std::mt19937_64& rng, bool allow_large) -> std::string {
+            uint64_t mode = rng() % 10;
+            if (mode == 0) return {};
+            pb::OrderEnvelope msg;
+            if (rng() & 1) msg.set_order_id(static_cast<int64_t>(100 + (rng() % 50000)));
+            if (rng() & 1) msg.set_buyer_name(sample_strings[1 + (rng() % (sample_strings.size() - 1))]);
+            if (rng() & 1) msg.set_status(static_cast<int32_t>(1 + (rng() % 120)));
+            if (rng() & 1) msg.set_updated_at_fixed64(0x1122334455667788ULL ^ rng());
+            if (rng() & 1) {
+                auto* u = msg.mutable_user();
+                u->set_user_id(static_cast<int64_t>(10 + (rng() % 5000)));
+                u->set_city(sample_strings[1 + (rng() % 5)]);
+                u->set_vip_level(static_cast<int32_t>(1 + (rng() % 9)));
+                u->set_score(12.5 + static_cast<double>(rng() % 50));
+                u->set_email("u" + std::to_string(rng() % 100) + "@test.io");
+            }
+            size_t icnt = (allow_large && mode == 9) ? (135 + (rng() % 20)) : (rng() % 6);
+            for (size_t i = 0; i < icnt; i++) {
+                auto* it = msg.add_items();
+                it->set_item_id(static_cast<int64_t>(1000 + i));
+                it->set_sku("SKU-" + std::to_string(i));
+                it->set_quantity(static_cast<int32_t>(1 + (rng() % 100)));
+                it->set_price_cents(static_cast<int64_t>(500 + (rng() % 9000)));
+                it->set_description("Desc-" + std::to_string(i));
+            }
+            if (rng() & 1) {
+                std::string pl(1 + (rng() % 24), '\0');
+                for (char& c : pl) c = static_cast<char>(rng() & 0xFF);
+                msg.set_payload(pl);
+            }
+            if (rng() & 1) msg.set_auth_token("tok-" + std::to_string(rng() % 9999));
+            if (rng() & 1) msg.set_trace_id("tr-" + std::to_string(rng() % 9999));
+            if (rng() & 1) msg.set_total_cents(static_cast<int64_t>(1000 + (rng() % 100000)));
+            if (rng() & 1) {
+                auto* uf = msg.GetReflection()->MutableUnknownFields(&msg);
+                uf->AddVarint(50, 123456789ULL + (rng() % 1000));
+                uf->AddLengthDelimited(51, "unk-" + std::to_string(rng() % 100));
+            }
+            std::string base;
+            LP_CHECK(msg.SerializeToString(&base));
+            if (mode == 1 || mode == 2) {
+                pb::UserProfile s1, s2;
+                s1.set_user_id(static_cast<int64_t>(11 + (rng() % 100)));
+                s1.set_city("SH");
+                s2.set_vip_level(static_cast<int32_t>(1 + (rng() % 9)));
+                s2.set_email("split@io");
+                std::string b1 = s1.SerializeAsString();
+                std::string b2 = s2.SerializeAsString();
+                std::string res;
+                res.resize(base.size() + b1.size() + b2.size() + 32);
+                WireWriter w(reinterpret_cast<uint8_t*>(res.data()));
+                w.write_len_delimited(5, b1);
+                w.write_raw(reinterpret_cast<const uint8_t*>(base.data()), static_cast<uint32_t>(base.size()));
+                w.write_len_delimited(5, b2);
+                res.resize(w.size());
+                return res;
+            }
+            return base;
+        };
+
+        // 9a. OrderEnvelopeView stateful differential fuzzer (80 seeds x 4 rounds x 25 steps)
+        {
+            OrderEnvelopeView env;
+            LineItemView eager_tmp;
+            for (uint64_t seed = 1; seed <= 80; seed++) {
+                std::mt19937_64 rng(seed * 0x517CC1B727220A95ULL);
+                for (int round = 0; round < 4; round++) {
+                    std::deque<std::string> owned_strings;
+                    auto pin = [&](std::string s) -> std::string_view {
+                        owned_strings.push_back(std::move(s));
+                        return owned_strings.back();
+                    };
+
+                    bool scratch_init = (round == 3 && (rng() % 4) == 0);
+                    std::string init_wire;
+                    pb::OrderEnvelope oracle;
+                    if (scratch_init) {
+                        env.init_scratch();
+                    } else {
+                        init_wire = make_random_wire(rng, true);
+                        env.wrap(reinterpret_cast<const uint8_t*>(init_wire.data()), 0, static_cast<uint32_t>(init_wire.size()));
+                        LP_CHECK(oracle.ParseFromArray(init_wire.data(), static_cast<int>(init_wire.size())));
+                    }
+
+                    if (!scratch_init && oracle.items_size() > 0 && (rng() & 1)) {
+                        uint32_t idx = static_cast<uint32_t>(rng() % static_cast<uint64_t>(oracle.items_size()));
+                        env.read_item_eager(idx, eager_tmp);
+                        const auto& exp = oracle.items(static_cast<int>(idx));
+                        LP_CHECK(eager_tmp.item_id_ == static_cast<uint64_t>(exp.item_id()));
+                        LP_CHECK(eager_tmp.sku_ == exp.sku());
+                        LP_CHECK(eager_tmp.quantity_ == exp.quantity());
+                        LP_CHECK(eager_tmp.price_cents_ == static_cast<uint64_t>(exp.price_cents()));
+                        LP_CHECK(eager_tmp.description_ == exp.description());
+                    }
+
+                    bool do_gets = (rng() & 1) != 0;
+                    for (int step = 0; step < 25; step++) {
+                        uint64_t op = rng() % 15;
+                        switch (op) {
+                            case 0: {
+                                uint64_t v = sample_varints[rng() % num_varints];
+                                env.set_order_id(v);
+                                oracle.set_order_id(static_cast<int64_t>(v));
+                                break;
+                            }
+                            case 1: {
+                                std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]);
+                                env.set_buyer_name(sv);
+                                oracle.set_buyer_name(sv.data(), sv.size());
+                                break;
+                            }
+                            case 2: {
+                                int32_t st = (rng() & 1) ? static_cast<int32_t>(1 + (rng() % 126))
+                                                         : static_cast<int32_t>(128 + (rng() % 50000));
+                                env.set_status(st);
+                                oracle.set_status(st);
+                                break;
+                            }
+                            case 3: {
+                                uint64_t f = rng();
+                                env.set_updated_at_fixed64(f);
+                                oracle.set_updated_at_fixed64(f);
+                                break;
+                            }
+                            case 4: {
+                                std::string pl(rng() % 32, '\0');
+                                for (char& c : pl) c = static_cast<char>(rng() & 0xFF);
+                                std::string_view sv = pin(std::move(pl));
+                                env.set_payload(sv);
+                                oracle.set_payload(sv.data(), sv.size());
+                                break;
+                            }
+                            case 5: {
+                                std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]);
+                                env.set_auth_token(sv);
+                                oracle.set_auth_token(sv.data(), sv.size());
+                                break;
+                            }
+                            case 6: {
+                                env.clear_auth_token();
+                                oracle.clear_auth_token();
+                                break;
+                            }
+                            case 7: {
+                                std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]);
+                                env.set_trace_id(sv);
+                                oracle.set_trace_id(sv.data(), sv.size());
+                                break;
+                            }
+                            case 8: {
+                                uint64_t v = sample_varints[rng() % num_varints];
+                                env.set_total_cents(v);
+                                oracle.set_total_cents(static_cast<int64_t>(v));
+                                break;
+                            }
+                            case 9: {
+                                auto& u = env.mutable_user();
+                                auto* ou = oracle.mutable_user();
+                                switch (rng() % 5) {
+                                    case 0: { uint64_t v = sample_varints[rng() % num_varints]; u.set_user_id(v); ou->set_user_id(static_cast<int64_t>(v)); break; }
+                                    case 1: { std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]); u.set_city(sv); ou->set_city(sv.data(), sv.size()); break; }
+                                    case 2: { int32_t v = static_cast<int32_t>(1 + (rng() % 500)); u.set_vip_level(v); ou->set_vip_level(v); break; }
+                                    case 3: { double sc = static_cast<double>(rng() % 1000) * 0.25; u.set_score(sc); ou->set_score(sc); break; }
+                                    case 4: { std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]); u.set_email(sv); ou->set_email(sv.data(), sv.size()); break; }
+                                }
+                                break;
+                            }
+                            case 10:
+                            case 11: {
+                                if (oracle.items_size() > 0) {
+                                    uint32_t idx = static_cast<uint32_t>(rng() % static_cast<uint64_t>(oracle.items_size()));
+                                    auto& it = env.items(idx);
+                                    auto* oit = oracle.mutable_items(static_cast<int>(idx));
+                                    switch (rng() % 5) {
+                                        case 0: { uint64_t v = sample_varints[rng() % num_varints]; it.set_item_id(v); oit->set_item_id(static_cast<int64_t>(v)); break; }
+                                        case 1: { std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]); it.set_sku(sv); oit->set_sku(sv.data(), sv.size()); break; }
+                                        case 2: { int32_t q = static_cast<int32_t>(1 + (rng() % 500)); it.set_quantity(q); oit->set_quantity(q); break; }
+                                        case 3: { uint64_t p = sample_varints[rng() % num_varints]; it.set_price_cents(p); oit->set_price_cents(static_cast<int64_t>(p)); break; }
+                                        case 4: { std::string_view sv = pin(sample_strings[rng() % sample_strings.size()]); it.set_description(sv); oit->set_description(sv.data(), sv.size()); break; }
+                                    }
+                                }
+                                break;
+                            }
+                            case 12: {
+                                if (oracle.items_size() < 165) {
+                                    auto& it = env.add_item();
+                                    auto* oit = oracle.add_items();
+                                    uint64_t id = 5000ULL + static_cast<uint64_t>(step);
+                                    std::string_view sku = pin("APP-" + std::to_string(rng() % 1000));
+                                    int32_t q = static_cast<int32_t>(1 + (rng() % 50));
+                                    it.set_item_id(id).set_sku(sku).set_quantity(q);
+                                    oit->set_item_id(static_cast<int64_t>(id));
+                                    oit->set_sku(sku.data(), sku.size());
+                                    oit->set_quantity(q);
+                                }
+                                break;
+                            }
+                            case 13: {
+                                if (do_gets) {
+                                    LP_CHECK(env.order_id() == static_cast<uint64_t>(oracle.order_id()));
+                                    LP_CHECK(env.buyer_name() == oracle.buyer_name());
+                                    LP_CHECK(env.status() == oracle.status());
+                                    LP_CHECK(env.updated_at_fixed64() == oracle.updated_at_fixed64());
+                                    LP_CHECK(env.auth_token() == oracle.auth_token());
+                                    LP_CHECK(env.trace_id() == oracle.trace_id());
+                                    LP_CHECK(env.total_cents() == static_cast<uint64_t>(oracle.total_cents()));
+                                    LP_CHECK(env.items_count() == static_cast<uint32_t>(oracle.items_size()));
+                                }
+                                break;
+                            }
+                            case 14: {
+                                size_t max_sz = env.max_merged_size();
+                                std::vector<uint8_t> exact(max_sz);
+                                size_t actual = env.merge_to(exact.data(), exact.size());
+                                LP_CHECK(actual <= max_sz);
+                                pb::OrderEnvelope dec;
+                                LP_CHECK(dec.ParseFromArray(exact.data(), static_cast<int>(actual)));
+                                assert_pb_equal(oracle, dec);
+                                break;
+                            }
+                        }
+                    }
+
+                    size_t max_sz = env.max_merged_size();
+                    std::vector<uint8_t> exact(max_sz);
+                    size_t actual = env.merge_to(exact.data(), exact.size());
+                    LP_CHECK(actual <= max_sz);
+                    std::string merged_str;
+                    env.merge_to(merged_str);
+                    LP_CHECK(merged_str.size() == actual);
+                    if (actual > 0) LP_CHECK(std::memcmp(exact.data(), merged_str.data(), actual) == 0);
+                    pb::OrderEnvelope dec;
+                    LP_CHECK(dec.ParseFromArray(exact.data(), static_cast<int>(actual)));
+                    assert_pb_equal(oracle, dec);
+                }
+            }
+        }
+
+        // 9b. WireView stateful differential fuzzer (80 seeds x 4 rounds x 28 steps)
+        {
+            WireView wv;
+            for (uint64_t seed = 1; seed <= 80; seed++) {
+                std::mt19937_64 rng(seed * 0x9E3779B97F4A7C15ULL);
+                // Keep all round input/slice buffers alive across rounds so mutating stale child
+                // views from round r-1 after wrap() still has valid backing memory.
+                std::deque<std::string> owned_bufs;
+                auto pin = [&](std::string s) -> std::string_view {
+                    owned_bufs.push_back(std::move(s));
+                    return owned_bufs.back();
+                };
+                WireView* stale_sub_prev = nullptr;
+                WireView* stale_rep_prev = nullptr;
+                for (int round = 0; round < 4; round++) {
+                    std::string_view init_wire = pin(make_random_wire(rng, false));
+                    wv.wrap(reinterpret_cast<const uint8_t*>(init_wire.data()), init_wire.size());
+                    pb::OrderEnvelope oracle;
+                    LP_CHECK(oracle.ParseFromArray(init_wire.data(), static_cast<int>(init_wire.size())));
+
+                    // Mutate stale child pointers from previous round (must be detached!)
+                    if (stale_sub_prev != nullptr) {
+                        stale_sub_prev->set_varint(1, 999999ULL);
+                        stale_sub_prev->set_bytes_copy(2, "STALE_CORRUPT");
+                    }
+                    if (stale_rep_prev != nullptr) {
+                        stale_rep_prev->set_int32(3, 888888);
+                    }
+                    LP_CHECK(wv.is_clean());
+
+                    bool field6_overridden = false;
+                    bool do_gets = (rng() & 1) != 0;
+                    WireView* held_stale_sub = nullptr;
+                    WireView* held_stale_rep = nullptr;
+
+                    for (int step = 0; step < 28; step++) {
+                        uint64_t op = rng() % 18;
+                        switch (op) {
+                            case 0: {
+                                uint64_t v = sample_varints[rng() % num_varints];
+                                wv.set_varint(1, v);
+                                oracle.set_order_id(static_cast<int64_t>(v));
+                                break;
+                            }
+                            case 1: {
+                                std::string s = sample_strings[rng() % sample_strings.size()];
+                                if (rng() & 1) wv.set_bytes_copy(2, s);
+                                else wv.set_bytes(2, pin(s));
+                                oracle.set_buyer_name(s);
+                                break;
+                            }
+                            case 2: {
+                                int32_t st = (rng() & 1) ? static_cast<int32_t>(1 + (rng() % 126))
+                                                         : static_cast<int32_t>(128 + (rng() % 50000));
+                                wv.set_int32(3, st);
+                                oracle.set_status(st);
+                                break;
+                            }
+                            case 3: {
+                                uint64_t f = rng();
+                                wv.set_fixed64(4, f);
+                                oracle.set_updated_at_fixed64(f);
+                                break;
+                            }
+                            case 4: {
+                                WireView& sub = wv.sub(5);
+                                stale_sub_prev = &sub;
+                                switch (rng() % 6) {
+                                    case 0: { uint64_t v = sample_varints[rng() % num_varints]; sub.set_varint(1, v); oracle.mutable_user()->set_user_id(static_cast<int64_t>(v)); break; }
+                                    case 1: { std::string c = sample_strings[rng() % sample_strings.size()]; sub.set_bytes_copy(2, c); oracle.mutable_user()->set_city(c); break; }
+                                    case 2: { int32_t v = (rng() & 1) ? static_cast<int32_t>(1 + (rng() % 126)) : static_cast<int32_t>(128 + (rng() % 500)); sub.set_int32(3, v); oracle.mutable_user()->set_vip_level(v); break; }
+                                    case 3: { double sc = static_cast<double>(rng() % 1000) * 0.5; sub.set_double(4, sc); oracle.mutable_user()->set_score(sc); break; }
+                                    case 4: { std::string e = sample_strings[rng() % sample_strings.size()]; sub.set_bytes_copy(5, e); oracle.mutable_user()->set_email(e); break; }
+                                    case 5: {
+                                        if (oracle.has_user()) {
+                                            sub.erase(2);
+                                            oracle.mutable_user()->clear_city();
+                                        }
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            case 5: {
+                                pb::UserProfile nu;
+                                nu.set_user_id(static_cast<int64_t>(1 + (rng() % 120)));
+                                nu.set_city((rng() & 1) ? "SH" : sample_strings[rng() % sample_strings.size()]);
+                                nu.set_vip_level(static_cast<int32_t>(1 + (rng() % 9)));
+                                std::string_view ub = pin(nu.SerializeAsString());
+                                WireView& sub = wv.sub(5);
+                                stale_sub_prev = &sub;
+                                sub.wrap(reinterpret_cast<const uint8_t*>(ub.data()), ub.size());
+                                *oracle.mutable_user() = nu;
+                                break;
+                            }
+                            case 6: {
+                                held_stale_sub = &wv.sub(5);
+                                pb::UserProfile nu;
+                                nu.set_user_id(static_cast<int64_t>(1 + (rng() % 120)));
+                                if (rng() & 1) nu.set_city("C" + std::to_string(rng() % 99));
+                                std::string ub = nu.SerializeAsString();
+                                wv.set_bytes_copy(5, ub);
+                                *oracle.mutable_user() = nu;
+                                break;
+                            }
+                            case 7:
+                            case 8: {
+                                if (!field6_overridden && oracle.items_size() > 0) {
+                                    size_t cnt = wv.repeated_count(6);
+                                    LP_CHECK(cnt == static_cast<size_t>(oracle.items_size()));
+                                    size_t idx = rng() % cnt;
+                                    WireView& rv = wv.repeated_sub(6, idx);
+                                    stale_rep_prev = &rv;
+                                    auto* oit = oracle.mutable_items(static_cast<int>(idx));
+                                    switch (rng() % 6) {
+                                        case 0: { uint64_t v = sample_varints[rng() % num_varints]; rv.set_varint(1, v); oit->set_item_id(static_cast<int64_t>(v)); break; }
+                                        case 1: { std::string s = sample_strings[rng() % sample_strings.size()]; rv.set_bytes_copy(2, s); oit->set_sku(s); break; }
+                                        case 2: { int32_t q = (rng() & 1) ? static_cast<int32_t>(1 + (rng() % 126)) : static_cast<int32_t>(128 + (rng() % 500)); rv.set_int32(3, q); oit->set_quantity(q); break; }
+                                        case 3: { uint64_t p = sample_varints[rng() % num_varints]; rv.set_varint(4, p); oit->set_price_cents(static_cast<int64_t>(p)); break; }
+                                        case 4: { std::string d = sample_strings[rng() % sample_strings.size()]; rv.set_bytes_copy(5, d); oit->set_description(d); break; }
+                                        case 5: { rv.erase(5); oit->clear_description(); break; }
+                                    }
+                                }
+                                break;
+                            }
+                            case 9: {
+                                if (!field6_overridden && oracle.items_size() > 0) {
+                                    size_t idx = rng() % static_cast<size_t>(oracle.items_size());
+                                    pb::LineItem nit;
+                                    nit.set_item_id(static_cast<int64_t>(1 + (rng() % 100)));
+                                    nit.set_quantity(static_cast<int32_t>(1 + (rng() % 120)));
+                                    nit.set_sku("W-" + std::to_string(rng() % 99));
+                                    std::string_view ib = pin(nit.SerializeAsString());
+                                    WireView& rv = wv.repeated_sub(6, idx);
+                                    stale_rep_prev = &rv;
+                                    rv.wrap(reinterpret_cast<const uint8_t*>(ib.data()), ib.size());
+                                    *oracle.mutable_items(static_cast<int>(idx)) = nit;
+                                }
+                                break;
+                            }
+                            case 10: {
+                                if (!field6_overridden && oracle.items_size() > 0) {
+                                    held_stale_rep = &wv.repeated_sub(6, 0);
+                                }
+                                pb::LineItem sit;
+                                sit.set_quantity(static_cast<int32_t>(1 + (rng() % 126)));
+                                if (rng() & 1) sit.set_sku("S" + std::to_string(rng() % 10));
+                                std::string ib = sit.SerializeAsString();
+                                wv.set_bytes_copy(6, ib);
+                                oracle.clear_items();
+                                *oracle.add_items() = sit;
+                                field6_overridden = true;
+                                break;
+                            }
+                            case 11: {
+                                switch (rng() % 4) {
+                                    case 0: {
+                                        std::string pl(rng() % 24, '\0');
+                                        for (char& c : pl) c = static_cast<char>(rng() & 0xFF);
+                                        wv.set_bytes_copy(7, pl);
+                                        oracle.set_payload(pl);
+                                        break;
+                                    }
+                                    case 1: { std::string s = sample_strings[rng() % sample_strings.size()]; wv.set_bytes_copy(8, s); oracle.set_auth_token(s); break; }
+                                    case 2: { std::string s = sample_strings[rng() % sample_strings.size()]; wv.set_bytes_copy(9, s); oracle.set_trace_id(s); break; }
+                                    case 3: { uint64_t v = sample_varints[rng() % num_varints]; wv.set_varint(10, v); oracle.set_total_cents(static_cast<int64_t>(v)); break; }
+                                }
+                                break;
+                            }
+                            case 12: {
+                                uint32_t target = static_cast<uint32_t>(1 + (rng() % 10));
+                                if (target == 5) held_stale_sub = &wv.sub(5);
+                                if (target == 6 && !field6_overridden && oracle.items_size() > 0) {
+                                    held_stale_rep = &wv.repeated_sub(6, 0);
+                                }
+                                wv.erase(target);
+                                switch (target) {
+                                    case 1: oracle.clear_order_id(); break;
+                                    case 2: oracle.clear_buyer_name(); break;
+                                    case 3: oracle.clear_status(); break;
+                                    case 4: oracle.clear_updated_at_fixed64(); break;
+                                    case 5: oracle.clear_user(); break;
+                                    case 6: oracle.clear_items(); field6_overridden = true; break;
+                                    case 7: oracle.clear_payload(); break;
+                                    case 8: oracle.clear_auth_token(); break;
+                                    case 9: oracle.clear_trace_id(); break;
+                                    case 10: oracle.clear_total_cents(); break;
+                                }
+                                break;
+                            }
+                            case 13: {
+                                if (held_stale_sub != nullptr) {
+                                    held_stale_sub->set_varint(1, 777777ULL);
+                                    held_stale_sub->set_bytes_copy(2, "DETACHED_SUB");
+                                }
+                                if (held_stale_rep != nullptr) {
+                                    held_stale_rep->set_int32(3, 666666);
+                                }
+                                break;
+                            }
+                            case 14: {
+                                if (do_gets) {
+                                    LP_CHECK(wv.get_varint(1) == static_cast<uint64_t>(oracle.order_id()));
+                                    LP_CHECK(wv.get_bytes(2) == oracle.buyer_name());
+                                    LP_CHECK(wv.get_int32(3) == oracle.status());
+                                    LP_CHECK(wv.get_fixed64(4) == oracle.updated_at_fixed64());
+                                    LP_CHECK(wv.get_bytes(8) == oracle.auth_token());
+                                    LP_CHECK(wv.get_bytes(9) == oracle.trace_id());
+                                    LP_CHECK(wv.get_varint(10) == static_cast<uint64_t>(oracle.total_cents()));
+                                    if (oracle.has_user()) {
+                                        LP_CHECK(wv.sub(5).get_varint(1) == static_cast<uint64_t>(oracle.user().user_id()));
+                                        LP_CHECK(wv.sub(5).get_bytes(2) == oracle.user().city());
+                                    }
+                                }
+                                break;
+                            }
+                            case 15:
+                            case 16:
+                            case 17: {
+                                size_t max_sz = wv.max_merged_size();
+                                std::vector<uint8_t> exact(max_sz);
+                                size_t actual = wv.merge_to(exact.data(), exact.size());
+                                LP_CHECK(actual <= max_sz);
+                                pb::OrderEnvelope dec;
+                                LP_CHECK(dec.ParseFromArray(exact.data(), static_cast<int>(actual)));
+                                assert_pb_equal(oracle, dec);
+                                break;
+                            }
+                        }
+                    }
+
+                    size_t max_sz = wv.max_merged_size();
+                    std::vector<uint8_t> exact(max_sz);
+                    size_t actual = wv.merge_to(exact.data(), exact.size());
+                    LP_CHECK(actual <= max_sz);
+                    std::string merged_str;
+                    wv.merge_to(merged_str);
+                    LP_CHECK(merged_str.size() == actual);
+                    if (actual > 0) LP_CHECK(std::memcmp(exact.data(), merged_str.data(), actual) == 0);
+                    pb::OrderEnvelope dec;
+                    LP_CHECK(dec.ParseFromArray(exact.data(), static_cast<int>(actual)));
+                    assert_pb_equal(oracle, dec);
+                }
+            }
+        }
+    }
+
     std::printf("[Correctness] All C++20 Lower-Level vs Official libprotobuf checks PASSED.\n\n");
 }
 
@@ -524,9 +1233,19 @@ BenchMetric measure_bench(int warmup, int iters, Fn&& fn) {
     return {ns, total_alloc / static_cast<uint64_t>(iters)};
 }
 
-int main() {
+int main(int argc, char** argv) {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
+    bool test_only = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--test-only") == 0) {
+            test_only = true;
+        }
+    }
     run_correctness_tests();
+    if (test_only) {
+        google::protobuf::ShutdownProtobufLibrary();
+        return 0;
+    }
 
     std::vector<uint8_t> complex_bytes = create_complex_order_bytes(100, 4096);
     std::vector<uint8_t> medium_bytes  = create_complex_order_bytes(20, 256);

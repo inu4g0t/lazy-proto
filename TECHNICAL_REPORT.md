@@ -1,6 +1,6 @@
 # Lazy-Proto 技术总结报告：分层架构（Lower Level + Java Compat）与真实官方基线对比
 
-> **报告概述**：本报告基于统一 Schema [proto/order_envelope.proto](/home/inu4g0t/t3work/lazy-proto/proto/order_envelope.proto)，对 `lazy-proto` 的两层设计——**Lower Level（Java `io.lazyproto.core` + C++20 无兼容 Input-Bytes Wrapper）**与 **Java Intermediate Compat Layer（`Message`/`Builder` 兼容）**——与真实官方 `protoc 3.25.5` (Java) / `libprotobuf 3.21.12` (C++) 及手写 Eager 基线进行了同生命周期、同输出缓冲口径（含对称防 DCE 保活）的交叉验证与微基准评测。
+> **报告概述**：本报告基于统一 Schema [proto/order_envelope.proto](proto/order_envelope.proto)，对 `lazy-proto` 的两层设计——**Lower Level（Java `io.lazyproto.core` + C++20 无兼容 Input-Bytes Wrapper）**与 **Java Intermediate Compat Layer（`Message`/`Builder` 兼容）**——与真实官方 `protoc 3.25.5` (Java) / `libprotobuf 3.21.12` (C++) 及手写 Eager 基线进行了同生命周期、同输出缓冲口径（含对称防 DCE 保活）的交叉验证与微基准评测。
 
 ---
 
@@ -96,7 +96,7 @@
 1. **Java 分层效果与真实性能边界**：将 `io.lazyproto.core`（`RawOrderEnvelope` / `RawWireView`）从 `Message`/`Builder` 兼容税中剥离后，Java Lower Level 在 **A1–A6、B1、B4 复用场景全部达到 `0 B/op`**（A2–A6 最高达 `28.71x`，B3 追平官方至 `0.97x`）；在需要 100% 解码全量 JVM `String` 的 **B2 劣势场景**中，Lower Level（`15,160 ns, 15,520 B`）优于 Compat（`18,437 ns, 19,545 B`），但仍明显慢于 Eager 单遍顺序反序列化（`0.46x`），符合“按需懒解析适用稀疏读写、全树 `String` 读取不占优”的架构预期。
 2. **C++ 纯 Lower Level 在严格对等生命周期下全面领先**：即便在每轮新建对象（`Lazy-Fresh` vs `PB-Fresh`）并开启输出防 DCE 保活后，A1–A6 仍实现 **`22.07x ~ 37.72x`** 领先，B1–B3 实现 **`2.29x ~ 10.39x`** 领先；复用模式下全场景 **`0 B/op`** 且全部优于 `libprotobuf` Reuse（含 B4 极小包 `1.15x`）。
 3. **仓库索引**：
-   - 统一协议定义：[order_envelope.proto](/home/inu4g0t/t3work/lazy-proto/proto/order_envelope.proto)
-   - Java Lower Level：[WireTape.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/core/WireTape.java)、[ScratchUtf8Arena.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/core/ScratchUtf8Arena.java)、[RawOrderEnvelope.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/core/RawOrderEnvelope.java)、[RawWireView.java](/home/inu4g0t/t3work/lazy-proto/src/main/java/io/lazyproto/core/RawWireView.java)
-   - Java Compat & 测试：[pom.xml](/home/inu4g0t/t3work/lazy-proto/pom.xml)、[LazyProtoBenchmarkSuite.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoBenchmarkSuite.java)、[LazyProtoCorrectnessTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/LazyProtoCorrectnessTest.java)、[StatefulModelFuzzTest.java](/home/inu4g0t/t3work/lazy-proto/src/test/java/io/lazyproto/StatefulModelFuzzTest.java)
-   - C++ Lower Level：[Makefile](/home/inu4g0t/t3work/lazy-proto/cpp/Makefile)、[lazy_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/lazy_proto.hpp)、[std_proto.hpp](/home/inu4g0t/t3work/lazy-proto/cpp/std_proto.hpp)、[benchmark_main.cpp](/home/inu4g0t/t3work/lazy-proto/cpp/benchmark_main.cpp)
+   - 统一协议定义：[order_envelope.proto](proto/order_envelope.proto)
+   - Java Lower Level：[WireTape.java](src/main/java/io/lazyproto/core/WireTape.java)、[ScratchUtf8Arena.java](src/main/java/io/lazyproto/core/ScratchUtf8Arena.java)、[RawOrderEnvelope.java](src/main/java/io/lazyproto/core/RawOrderEnvelope.java)、[RawWireView.java](src/main/java/io/lazyproto/core/RawWireView.java)
+   - Java Compat & 测试：[pom.xml](pom.xml)、[LazyProtoBenchmarkSuite.java](src/test/java/io/lazyproto/LazyProtoBenchmarkSuite.java)、[LazyProtoCorrectnessTest.java](src/test/java/io/lazyproto/LazyProtoCorrectnessTest.java)、[StatefulModelFuzzTest.java](src/test/java/io/lazyproto/StatefulModelFuzzTest.java)
+   - C++ Lower Level：[Makefile](cpp/Makefile)、[lazy_proto.hpp](cpp/lazy_proto.hpp)、[std_proto.hpp](cpp/std_proto.hpp)、[benchmark_main.cpp](cpp/benchmark_main.cpp)

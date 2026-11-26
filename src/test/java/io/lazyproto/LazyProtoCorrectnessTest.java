@@ -1006,6 +1006,172 @@ public class LazyProtoCorrectnessTest {
         }
     }
 
+    @Test
+    @DisplayName("F4: Lower-Level bug regressions (multi-entry FP1 shadow, repeatedSub counter leak, child detach, readItemEager)")
+    public void testF4_LowerLevelBugRegressions() throws Exception {
+        // Bug 1a: Split submessage (2a 02 08 01 2a 02 18 02) + same-size setBytes(5, {0x08, 0x09})
+        // Must NOT take FP1; earlier shadowed entry must be stripped from output.
+        {
+            byte[] splitUser = new byte[] {0x2A, 0x02, 0x08, 0x01, 0x2A, 0x02, 0x18, 0x02};
+            RawWireView wv = new RawWireView().wrap(splitUser, 0, splitUser.length);
+            byte[] replacement = new byte[] {0x08, 0x09}; // same length (2B) as last segment
+            wv.setBytes(5, replacement, 0, replacement.length);
+            assertFalse(wv.isSameSizeDirtyOnly(), "Shadowed multi-entry field must not use FP1");
+            byte[] out = wv.toByteArray();
+            assertEquals("2a020809", bytesToHex(out));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals(9L, dec.getUser().getUserId());
+            assertEquals(0, dec.getUser().getVipLevel());
+        }
+
+        // Bug 1b: Repeated field (32 02 18 01 32 02 18 02) + same-size setBytes(6, {0x18, 0x09})
+        {
+            byte[] twoItems = new byte[] {0x32, 0x02, 0x18, 0x01, 0x32, 0x02, 0x18, 0x02};
+            RawWireView wv = new RawWireView().wrap(twoItems, 0, twoItems.length);
+            byte[] replacement = new byte[] {0x18, 0x09};
+            wv.setBytes(6, replacement, 0, replacement.length);
+            assertFalse(wv.isSameSizeDirtyOnly(), "Shadowed repeated field must not use FP1");
+            byte[] out = wv.toByteArray();
+            assertEquals("32021809", bytesToHex(out));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals(1, dec.getItemsCount());
+            assertEquals(9, dec.getItems(0).getQuantity());
+        }
+
+        // Bug 1c: Duplicate scalar (08 01 08 02) + same-size setInt64(1, 5)
+        {
+            byte[] dupScalar = new byte[] {0x08, 0x01, 0x08, 0x02};
+            RawWireView wv = new RawWireView().wrap(dupScalar, 0, dupScalar.length);
+            wv.setInt64(1, 5L);
+            assertFalse(wv.isSameSizeDirtyOnly(), "Shadowed duplicate scalar must not use FP1");
+            byte[] out = wv.toByteArray();
+            assertEquals("0805", bytesToHex(out));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out);
+            assertEquals(5L, dec.getOrderId());
+        }
+
+        // Bug 2: repeatedSub mutate -> setBytes / setInt* / erase dirty-counter leak check
+        {
+            // Single entry: var-size repeatedSub edit -> same-size setBytes must restore FP1 eligibility
+            byte[] oneItem = new byte[] {0x32, 0x02, 0x18, 0x01};
+            RawWireView wv = new RawWireView().wrap(oneItem, 0, oneItem.length);
+            wv.repeatedSub(6, 0).setInt32(3, 500); // varSizeDirtyCount = 1
+            assertFalse(wv.isSameSizeDirtyOnly());
+            byte[] sameRep = new byte[] {0x18, 0x09};
+            wv.setBytes(6, sameRep, 0, sameRep.length); // must clear leaked varSizeDirtyCount!
+            assertTrue(wv.isSameSizeDirtyOnly(), "varSizeDirtyCount leaked from prior repeatedSub edit");
+            byte[] out1 = wv.toByteArray();
+            assertEquals("32021809", bytesToHex(out1));
+            io.lazyproto.bench.proto.OrderEnvelope dec1 = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(out1);
+            assertEquals(1, dec1.getItemsCount());
+            assertEquals(9, dec1.getItems(0).getQuantity());
+
+            // Multi-entry: same-size + var-size repeatedSub edits -> setBytes -> erase
+            byte[] twoItems = new byte[] {0x32, 0x02, 0x18, 0x01, 0x32, 0x02, 0x18, 0x02};
+            wv.wrap(twoItems, 0, twoItems.length);
+            wv.repeatedSub(6, 0).setInt32(3, 5);   // same-size
+            wv.repeatedSub(6, 1).setInt32(3, 500); // var-size
+            wv.setBytes(6, sameRep, 0, sameRep.length);
+            assertFalse(wv.isSameSizeDirtyOnly());
+            assertEquals("32021809", bytesToHex(wv.toByteArray()));
+            wv.erase(6);
+            assertEquals("", bytesToHex(wv.toByteArray()));
+            io.lazyproto.bench.proto.OrderEnvelope decEmpty = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(wv.toByteArray());
+            assertEquals(0, decEmpty.getItemsCount());
+
+            // repeatedSub same-size edit -> erase with surviving sibling field
+            byte[] itemAndOrder = new byte[] {0x08, 0x01, 0x32, 0x02, 0x18, 0x01};
+            wv.wrap(itemAndOrder, 0, itemAndOrder.length);
+            wv.repeatedSub(6, 0).setInt32(3, 5);
+            assertTrue(wv.isSameSizeDirtyOnly());
+            wv.erase(6);
+            assertFalse(wv.isSameSizeDirtyOnly());
+            assertEquals("0801", bytesToHex(wv.toByteArray()));
+
+            // repeatedSub edit -> setInt64 on same field -> erase
+            wv.wrap(oneItem, 0, oneItem.length);
+            wv.repeatedSub(6, 0).setInt32(3, 500);
+            wv.setInt64(6, 7L);
+            assertEquals("3007", bytesToHex(wv.toByteArray()));
+            wv.erase(6);
+            assertEquals("", bytesToHex(wv.toByteArray()));
+        }
+
+        // Bug 3: Stale child view detachment after wrap(), setBytes(), and erase()
+        {
+            byte[] msg1 = new byte[] {0x2A, 0x02, 0x08, 0x01, 0x32, 0x02, 0x18, 0x01};
+            byte[] msg2 = new byte[] {0x2A, 0x02, 0x08, 0x02, 0x32, 0x02, 0x18, 0x02};
+            RawWireView wv = new RawWireView().wrap(msg1, 0, msg1.length);
+            RawWireView staleSub = wv.sub(5);
+            RawWireView staleRep = wv.repeatedSub(6, 0);
+            RawWireView staleGrand = staleSub.sub(2);
+
+            // Parent wrap() must detach staleSub, staleRep, and isolate staleGrand
+            wv.wrap(msg2, 0, msg2.length);
+            staleSub.setInt64(1, 999L);
+            staleSub.wrap(new byte[] {0x08, 0x77}, 0, 2);
+            staleRep.setInt32(3, 888);
+            staleRep.wrap(new byte[] {0x18, 0x66}, 0, 2);
+            staleGrand.setInt64(1, 777L);
+
+            assertTrue(wv.isClean(), "Stale child mutations after parent wrap() must not dirty parent");
+            assertEquals("2a02080232021802", bytesToHex(wv.toByteArray()));
+            io.lazyproto.bench.proto.OrderEnvelope dec = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(wv.toByteArray());
+            assertEquals(2L, dec.getUser().getUserId());
+            assertEquals(1, dec.getItemsCount());
+            assertEquals(2, dec.getItems(0).getQuantity());
+
+            // Parent setBytes() and erase() must detach stale sub and repeatedSub
+            RawWireView staleSub2 = wv.sub(5);
+            RawWireView staleRep2 = wv.repeatedSub(6, 0);
+            byte[] newUser = new byte[] {0x08, 0x07};
+            wv.setBytes(5, newUser, 0, newUser.length);
+            wv.erase(6);
+            staleSub2.setInt64(1, 555L);
+            staleRep2.setInt32(3, 444);
+
+            byte[] outAfterOverride = wv.toByteArray();
+            assertEquals("2a020807", bytesToHex(outAfterOverride));
+            io.lazyproto.bench.proto.OrderEnvelope dec2 = io.lazyproto.bench.proto.OrderEnvelope.parseFrom(outAfterOverride);
+            assertEquals(7L, dec2.getUser().getUserId());
+            assertEquals(0, dec2.getItemsCount());
+        }
+
+        // Bug 4: RawOrderEnvelope.wrap() -> readItemEager(0, out) directly without calling getItemsCount() first
+        {
+            byte[] rawOrder = io.lazyproto.bench.proto.OrderEnvelope.newBuilder()
+                    .setOrderId(77L)
+                    .addItems(io.lazyproto.bench.proto.LineItem.newBuilder()
+                            .setItemId(101L)
+                            .setSku("SKU-DIRECT")
+                            .setQuantity(4)
+                            .setPriceCents(2500L)
+                            .setDescription("Direct eager read")
+                            .build())
+                    .addItems(io.lazyproto.bench.proto.LineItem.newBuilder().build())
+                    .build().toByteArray();
+
+            RawOrderEnvelope env = new RawOrderEnvelope().wrap(rawOrder, 0, rawOrder.length);
+            assertFalse(env.isScanned());
+            RawOrderEnvelope.RawLineItem out = new RawOrderEnvelope.RawLineItem();
+            env.readItemEager(0, out); // Must scan lazily without needing getItemsCount() first
+            assertTrue(env.isScanned());
+            assertEquals(101L, out.itemId);
+            assertEquals(4, out.quantity);
+            assertEquals(2500L, out.priceCents);
+            assertEquals("SKU-DIRECT", new String(rawOrder, out.skuOff, out.skuLen, StandardCharsets.UTF_8));
+            assertEquals("Direct eager read", new String(rawOrder, out.descOff, out.descLen, StandardCharsets.UTF_8));
+
+            // Subsequent empty item read must clear previous fields
+            env.readItemEager(1, out);
+            assertEquals(0L, out.itemId);
+            assertEquals(0, out.skuLen);
+            assertEquals(0, out.quantity);
+            assertEquals(0L, out.priceCents);
+            assertEquals(0, out.descLen);
+        }
+    }
+
     private static String bytesToHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {

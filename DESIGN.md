@@ -107,8 +107,8 @@ TapeEntry (128 bits = 2 x 64-bit Words):
 ┌───────────────────────────────────────┬───────────────────────────────────────┐
 │ Word 0 [63..32]: tagOffset (uint32)   │ Word 0 [31..0]: recordEnd (uint32)    │
 ├──────────────────────┬────────┬───────┼───────────────────────────────────────┤
-│ Word 1 [63..35]:     │ [34..32│[31..28│ Word 1 [27..24]: │ Word 1 [23..0]:    │
-│ fieldNumber (29-bit) │wireType│ flags │ headerLen (4-bit)│ nextTapeIdx(24-bit)│
+│ Word 1 [63..35]:     │ [34..32│[31..29│ Word 1 [28..24]: │ Word 1 [23..0]:    │
+│ fieldNumber (29-bit) │wireType│ flags │ headerLen (5-bit)│ nextTapeIdx(24-bit)│
 └──────────────────────┴────────┴───────┴──────────────────┴────────────────────┘
 ```
 
@@ -116,16 +116,17 @@ TapeEntry (128 bits = 2 x 64-bit Words):
 1. **`tagOffset` (32-bit)**：该字段的 Tag Varint 在输入缓冲区中的起始偏移（支持单消息最大 4GB）。
 2. **`recordEnd` (32-bit)**：该字段净荷（Value）结束后的下一个字节偏移。
    - **完整原始字节区间** = `[tagOffset, recordEnd)`，总长度 = `recordEnd - tagOffset`。
-3. **`headerLen` (4-bit, `0..15`)**：`valueOffset - tagOffset`，即 `Tag Varint` +（可选的 `Length Varint`）占用的字节数。
-   - 因为 Tag Varint 最多 5 字节，Length Varint 最多 5 字节，两者之和恒 $\le 10 < 15$！
+3. **`headerLen` (5-bit, `0..31`)**：`valueOffset - tagOffset`，即 `Tag Varint` +（可选的 `Length Varint`）占用的字节数。
+   - 合法规范编码中 Tag Varint 与 Length Varint 均 $\le 5$ 字节；即使遇到非规范（overlong）编码，10 字节 Tag Varint + 10 字节 Length Varint 之和也恒 $\le 20 \le 31$！
    - 因此，**无需浪费一个 32-bit 整数存储 `valueOffset`**，通过 `valueOffset = tagOffset + headerLen` 即可在 1 个指令周期内算出净荷起始位置，同时算出净荷长度 `valueLen = recordEnd - valueOffset`！
 4. **`wireType` (3-bit, `0..5`)**：`0=Varint, 1=Fixed64, 2=LengthDelimited, 5=Fixed32`。
-5. **`flags` (4-bit 状态位)**：
-   - `0000 (CLEAN_RAW)`：原始未修改（可能已读并缓存，但值未变）。
-   - `0001 (DIRTY_SAME_SIZE)`：值被修改，但新编码长度与原净荷长度 `valueLen` **完全相等**（可走原地覆写 Fast-Path 1）。
-   - `0010 (DIRTY_VAR_SIZE)`：值被修改且编码长度发生变化，或子消息内部发生了变长修改。
-   - `0011 (DELETED)`：被用户显式调用 `clearXxx()` / `remove()` 删除。
-   - `0100 (SHADOWED)`：同一个非 `repeated` 标量字段在原始输入流后面再次出现，导致当前旧条目被覆盖失效。
+5. **`flags` (3-bit 状态位 / 种类位)**：
+   - `000 (CLEAN_RAW)`：原始未修改（可能已读并缓存，但值未变）。
+   - `001 (DIRTY_SAME_SIZE)`：值被修改，但新编码长度与原净荷长度 `valueLen` **完全相等**（可走原地覆写 Fast-Path 1）。
+   - `010 (DIRTY_VAR_SIZE)`：值被修改且编码长度发生变化，或子消息内部发生了变长修改。
+   - `011 (DELETED)`：被用户显式调用 `clearXxx()` / `remove()` 删除。
+   - `100 (SHADOWED)`：同一个非 `repeated` 标量字段在原始输入流后面再次出现，导致当前旧条目被覆盖失效。
+   - `101 / 110 (SPLIT_CONT / SPLIT_TAIL)`：分段子消息的前序与尾段标记（在 `ImmutableWireBase` 中对应只读 `KIND_*` 种类枚举）。
 6. **`nextTapeIdx` (24-bit, 最大支持单层 1600 万个条目)**：
    - 对于 `repeated` 字段（或分段传输的同名子消息），指向下一个具有相同 `fieldNumber` 的 `TapeEntry` 下标（`0xFFFFFF` 表示链表尾 `NULL`）。**完全用数组下标静态单链表替代了 `ArrayList`！**
 

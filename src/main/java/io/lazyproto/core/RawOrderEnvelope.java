@@ -316,6 +316,10 @@ public final class RawOrderEnvelope {
     }
 
     public void readItemEager(int index, RawLineItem outItem) {
+        ensureScanned();
+        if (index < 0 || index >= itemCount) {
+            throw new IndexOutOfBoundsException("Index " + index);
+        }
         int tIdx = itemTapeIdx[index];
         outItem.decodeAllEager(tape.buf, tape.valueOffset(tIdx), tape.valueLength(tIdx));
     }

@@ -554,11 +554,13 @@ public:
         WireView* saved_parent = parent_;
         uint32_t saved_field = parent_field_;
         int32_t saved_rep = parent_repeated_idx_;
+        uint64_t saved_epoch = parent_epoch_;
         reset_internal(data, len);
         if (saved_parent != nullptr) {
             parent_ = saved_parent;
             parent_field_ = saved_field;
             parent_repeated_idx_ = saved_rep;
+            parent_epoch_ = saved_epoch;
             replaced_from_wrap_ = true;
             notify_parent();
         }
@@ -597,6 +599,7 @@ public:
         FieldCache* fc = resolve_for_read(field_number);
         if (!fc) return default_val;
         if (fc->decoded && fc->kind == CacheKind::VARINT) return fc->num_val;
+        if (fc->last_tape_idx < 0 || fc->bytes_override || fc->sub_dirty) return default_val;
         const TapeEntry& e = tape_[static_cast<uint32_t>(fc->last_tape_idx)];
         if (e.wire_type != WIRETYPE_VARINT) return default_val;
         fc->num_val = read_varint64_at(buf_, e.value_offset);
@@ -613,6 +616,7 @@ public:
         FieldCache* fc = resolve_for_read(field_number);
         if (!fc) return default_val;
         if (fc->decoded && fc->kind == CacheKind::FIXED32) return static_cast<uint32_t>(fc->num_val);
+        if (fc->last_tape_idx < 0 || fc->bytes_override || fc->sub_dirty) return default_val;
         const TapeEntry& e = tape_[static_cast<uint32_t>(fc->last_tape_idx)];
         if (e.wire_type != WIRETYPE_FIXED32) return default_val;
         fc->num_val = read_fixed32_at(buf_, e.value_offset);
@@ -625,6 +629,7 @@ public:
         FieldCache* fc = resolve_for_read(field_number);
         if (!fc) return default_val;
         if (fc->decoded && fc->kind == CacheKind::FIXED64) return fc->num_val;
+        if (fc->last_tape_idx < 0 || fc->bytes_override || fc->sub_dirty) return default_val;
         const TapeEntry& e = tape_[static_cast<uint32_t>(fc->last_tape_idx)];
         if (e.wire_type != WIRETYPE_FIXED64) return default_val;
         fc->num_val = read_fixed64_at(buf_, e.value_offset);
@@ -693,6 +698,7 @@ public:
         child->parent_ = this;
         child->parent_field_ = field_number;
         child->parent_repeated_idx_ = -1;
+        child->parent_epoch_ = wrap_epoch_;
         if (!fc.bytes_override) {
             fc.kind = CacheKind::SUBVIEW;
             fc.decoded = true;
@@ -734,6 +740,7 @@ public:
         child->parent_ = this;
         child->parent_field_ = field_number;
         child->parent_repeated_idx_ = static_cast<int32_t>(idx);
+        child->parent_epoch_ = wrap_epoch_;
         fc.repeated_child_pool_indices[idx] = static_cast<uint32_t>(child_pool_used_ - 1);
         return *child;
     }
@@ -922,8 +929,15 @@ private:
     WireView* parent_ = nullptr;
     uint32_t parent_field_ = 0;
     int32_t parent_repeated_idx_ = -1;
+    uint64_t wrap_epoch_ = 0;
+    uint64_t parent_epoch_ = 0;
 
     void reset_internal(const uint8_t* data, size_t len) noexcept {
+        wrap_epoch_++;
+        for (size_t i = 0; i < child_pool_used_; i++) {
+            child_pool_[i]->parent_ = nullptr;
+            child_pool_[i]->parent_epoch_ = 0;
+        }
         buf_ = data;
         raw_len_ = static_cast<uint32_t>(len);
         scanned_ = false;
@@ -942,6 +956,7 @@ private:
         parent_ = nullptr;
         parent_field_ = 0;
         parent_repeated_idx_ = -1;
+        parent_epoch_ = 0;
     }
 
     void wrap_multi_segments(
@@ -1020,22 +1035,54 @@ private:
         child->parent_ = this;
         child->parent_field_ = field_number;
         child->parent_repeated_idx_ = rep_idx;
+        child->parent_epoch_ = wrap_epoch_;
         return child;
     }
 
+    void detach_repeated_children(FieldCache& fc) noexcept {
+        for (uint32_t pidx : fc.repeated_child_pool_indices) {
+            if (pidx != UINT32_MAX) {
+                child_pool_[pidx]->parent_ = nullptr;
+                child_pool_[pidx]->parent_epoch_ = 0;
+            }
+        }
+        fc.repeated_child_pool_indices.clear();
+    }
+
+    void clear_repeated_dirty_counts(FieldCache& fc) noexcept {
+        if (fc.rep_dirty_count > 0) {
+            for (uint32_t t_idx : fc.repeated_tape_indices) {
+                TapeEntry& e = tape_[t_idx];
+                if (e.flags == FLAG_DIRTY_SAME_SIZE) {
+                    same_size_dirty_count_--;
+                    e.flags = FLAG_CLEAN_RAW;
+                } else if (e.flags == FLAG_DIRTY_VAR_SIZE) {
+                    var_size_dirty_count_--;
+                    e.flags = FLAG_CLEAN_RAW;
+                }
+            }
+            fc.rep_dirty_count = 0;
+        }
+    }
+
     void invalidate_child_views(FieldCache& fc) noexcept {
-        fc.child_pool_idx = UINT32_MAX;
+        clear_repeated_dirty_counts(fc);
+        if (fc.child_pool_idx != UINT32_MAX) {
+            child_pool_[fc.child_pool_idx]->parent_ = nullptr;
+            child_pool_[fc.child_pool_idx]->parent_epoch_ = 0;
+            fc.child_pool_idx = UINT32_MAX;
+        }
         fc.sub_dirty = false;
         fc.bytes_override = false;
         fc.bytes_in_arena = false;
-        fc.repeated_child_pool_indices.clear();
-        fc.rep_dirty_count = 0;
+        detach_repeated_children(fc);
     }
 
     void clear_dirty_counts(FieldCache& fc) noexcept {
         if (fc.same_size_dirty) { same_size_dirty_count_--; fc.same_size_dirty = false; }
         if (fc.var_size_dirty)  { var_size_dirty_count_--;  fc.var_size_dirty = false; }
         if (fc.appended)        { appended_count_--;        fc.appended = false; }
+        clear_repeated_dirty_counts(fc);
     }
 
     void mark_scalar_dirty(FieldCache& fc, uint8_t expected_wt, uint32_t new_val_len) noexcept {
@@ -1046,7 +1093,9 @@ private:
                 tape_[fc.repeated_tape_indices[i]].flags = FLAG_SHADOWED;
             }
             TapeEntry& e = tape_[static_cast<uint32_t>(fc.last_tape_idx)];
-            if (e.wire_type == expected_wt && e.value_length() == new_val_len) {
+            if (fc.repeated_tape_indices.size() == 1U
+                    && e.wire_type == expected_wt
+                    && e.value_length() == new_val_len) {
                 e.flags = FLAG_DIRTY_SAME_SIZE;
                 fc.same_size_dirty = true;
                 same_size_dirty_count_++;
@@ -1068,11 +1117,33 @@ private:
     }
 
     void on_child_dirty(uint32_t field_number, int32_t rep_idx, const WireView& child) noexcept {
+        if (child.parent_ != this || child.parent_epoch_ != wrap_epoch_) return;
         int32_t s = find_slot(field_number);
         if (s < 0) return;
         FieldCache& fc = slots_[static_cast<size_t>(s)];
         if (rep_idx >= 0) {
-            uint32_t t_idx = fc.repeated_tape_indices[static_cast<size_t>(rep_idx)];
+            size_t r = static_cast<size_t>(rep_idx);
+            if (r >= fc.repeated_tape_indices.size() || r >= fc.repeated_child_pool_indices.size()) return;
+            uint32_t pidx = fc.repeated_child_pool_indices[r];
+            if (pidx == UINT32_MAX || child_pool_[pidx].get() != &child) return;
+            if (fc.same_size_dirty || fc.var_size_dirty || fc.appended || fc.sub_dirty || fc.bytes_override) {
+                if (fc.same_size_dirty) { same_size_dirty_count_--; fc.same_size_dirty = false; }
+                if (fc.var_size_dirty)  { var_size_dirty_count_--;  fc.var_size_dirty = false; }
+                if (fc.appended)        { appended_count_--;        fc.appended = false; }
+                if (fc.child_pool_idx != UINT32_MAX) {
+                    child_pool_[fc.child_pool_idx]->parent_ = nullptr;
+                    child_pool_[fc.child_pool_idx]->parent_epoch_ = 0;
+                    fc.child_pool_idx = UINT32_MAX;
+                }
+                fc.sub_dirty = false;
+                fc.bytes_override = false;
+                fc.bytes_in_arena = false;
+                for (uint32_t ti : fc.repeated_tape_indices) {
+                    tape_[ti].flags = FLAG_CLEAN_RAW;
+                }
+                fc.rep_dirty_count = 0;
+            }
+            uint32_t t_idx = fc.repeated_tape_indices[r];
             TapeEntry& e = tape_[t_idx];
             uint8_t prev = e.flags;
             if (prev == FLAG_DIRTY_SAME_SIZE) same_size_dirty_count_--;
@@ -1086,13 +1157,15 @@ private:
                 var_size_dirty_count_++;
             }
         } else {
+            if (fc.child_pool_idx == UINT32_MAX || child_pool_[fc.child_pool_idx].get() != &child) return;
+            clear_dirty_counts(fc);
+            detach_repeated_children(fc);
             fc.sub_dirty = true;
             fc.bytes_override = false;
             fc.kind = CacheKind::SUBVIEW;
             fc.decoded = true;
             fc.present = true;
             fc.deleted = false;
-            clear_dirty_counts(fc);
             if (!fc.repeated_tape_indices.empty()) {
                 for (size_t i = 0; i + 1 < fc.repeated_tape_indices.size(); i++) {
                     tape_[fc.repeated_tape_indices[i]].flags = FLAG_SHADOWED;
@@ -1616,6 +1689,11 @@ public:
     }
 
     void decode_all_eager() noexcept {
+        item_id_ = 0;
+        sku_ = std::string_view();
+        quantity_ = 0;
+        price_cents_ = 0;
+        description_ = std::string_view();
         uint32_t cursor = raw_off_;
         const uint32_t limit = raw_off_ + raw_len_;
         const uint8_t* b = buf_;
@@ -2032,7 +2110,9 @@ public:
         return *view;
     }
 
-    void read_item_eager(uint32_t index, LineItemView& out_item) const noexcept {
+    void read_item_eager(uint32_t index, LineItemView& out_item) {
+        ensure_scanned();
+        if (index >= item_tape_idx_.size()) throw std::out_of_range("LineItem index out of range");
         uint32_t t_idx = item_tape_idx_[index];
         out_item.buf_ = buf_;
         out_item.raw_off_ = tape_[t_idx].value_offset;

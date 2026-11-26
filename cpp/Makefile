@@ -7,7 +7,7 @@ GEN_DIR = gen
 GEN_SRCS = $(GEN_DIR)/order_envelope.pb.cc
 GEN_HDRS = $(GEN_DIR)/order_envelope.pb.h
 
-.PHONY: all clean run
+.PHONY: all clean run test
 
 all: benchmark_cpp
 
@@ -20,6 +20,9 @@ benchmark_cpp: benchmark_main.cpp $(GEN_SRCS) lazy_proto.hpp std_proto.hpp
 
 run: benchmark_cpp
 	./benchmark_cpp
+
+test: benchmark_cpp
+	./benchmark_cpp --test-only
 
 clean:
 	rm -rf $(GEN_DIR) benchmark_cpp
