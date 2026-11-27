@@ -1,0 +1,336 @@
+package io.lazyproto.runtime;
+
+import com.google.protobuf.ByteOutput;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import io.lazyproto.core.WireTape;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+
+/**
+ * Immutable wire-slice base with lazily populated, read-only 128-bit {@code FieldTape}.
+ *
+ * <p>Architecture v3 core invariant: once scanned (or frozen), an {@code ImmutableWireBase} is
+ * 100% read-only, contains zero mutation flags or parent back-pointers, and can be shared safely
+ * across arbitrary built {@link AbstractLazyMessage} snapshots, forked builders, and threads.
+ *
+ * <p>128-bit TapeEntry layout (2 {@code long} words per wire record):
+ * <ul>
+ *   <li>{@code tape[i * 2]}: {@code [63..32] tagOffset (uint32) | [31..0] recordEnd (uint32)}</li>
+ *   <li>{@code tape[i * 2 + 1]}: {@code [63..35] fieldNumber (29-bit) | [34..32] wireType (3-bit)
+ *       | [31..29] kind (3-bit) | [28..24] headerLen (5-bit) | [23..0] auxIndex (24-bit)}</li>
+ * </ul>
+ */
+public abstract class ImmutableWireBase {
+
+    // Immutable Wire Record Kinds (3-bit, stored in word1 [31..29])
+    public static final int KIND_UNKNOWN        = 0;
+    public static final int KIND_SHADOWED       = 1;
+    public static final int KIND_SCALAR_SLOT    = 2;
+    public static final int KIND_SPLIT_SUB_CONT = 3;
+    public static final int KIND_SPLIT_SUB_TAIL = 4;
+    public static final int KIND_REPEATED_ITEM  = 5;
+
+    public static final int NO_AUX_IDX = 0xFFFFFF;
+    public static final byte[] EMPTY_BYTES = new byte[0];
+    protected static final long[] EMPTY_TAPE = new long[0];
+
+    protected byte[] buf = EMPTY_BYTES;
+    protected int rawOffset;
+    protected int rawLength;
+
+    private final int initialTapeWords;
+    protected long[] tape = EMPTY_TAPE;
+    protected int tapeCount;
+
+    protected volatile boolean scanned;
+    protected boolean multiSegment;
+    protected boolean hasShadowedEntries;
+    protected volatile boolean frozen;
+
+    protected ImmutableWireBase(int initialTapeEntries) {
+        this.initialTapeWords = Math.max(8, initialTapeEntries << 1);
+    }
+
+    public final void freeze() {
+        if (!frozen) {
+            this.frozen = true;
+            onFreeze();
+        }
+    }
+
+    protected void onFreeze() {}
+
+    public final boolean isFrozen() {
+        return frozen;
+    }
+
+    public final boolean isScanned() {
+        return scanned;
+    }
+
+    public final boolean isMultiSegment() {
+        return multiSegment;
+    }
+
+    public final boolean hasShadowedEntries() {
+        return hasShadowedEntries;
+    }
+
+    public final boolean hasUnknownFields() {
+        ensureScanned();
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public final byte[] extractUnknownFieldsBytes() {
+        ensureScanned();
+        int totalBytes = 0;
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                totalBytes += tapeRecordLength(i);
+            }
+        }
+        if (totalBytes == 0) {
+            return EMPTY_BYTES;
+        }
+        byte[] out = new byte[totalBytes];
+        int pos = 0;
+        for (int i = 0; i < tapeCount; i++) {
+            if (tapeKind(i) == KIND_UNKNOWN) {
+                int off = tapeTagOffset(i);
+                int len = tapeRecordLength(i);
+                System.arraycopy(buf, off, out, pos, len);
+                pos += len;
+            }
+        }
+        return out;
+    }
+
+    public final byte[] rawBuffer() {
+        return buf;
+    }
+
+    public final int rawOffset() {
+        return rawOffset;
+    }
+
+    public final int rawLength() {
+        return rawLength;
+    }
+
+    public final void markScannedEmpty() {
+        if (frozen) {
+            throw new IllegalStateException("Cannot markScannedEmpty on a frozen ImmutableWireBase");
+        }
+        this.scanned = true;
+    }
+
+    public static boolean isSubSliceOf(ImmutableWireBase child, ImmutableWireBase parent, int parentTapeIdx) {
+        return child != null
+                && !child.isMultiSegment()
+                && parentTapeIdx >= 0
+                && child.rawBuffer() == parent.rawBuffer()
+                && child.rawOffset() == parent.tapeValueOffset(parentTapeIdx)
+                && child.rawLength() == parent.tapeValueLength(parentTapeIdx);
+    }
+
+    public final void wrapImmutable(byte[] buffer, int offset, int length) {
+        if (frozen) {
+            throw new IllegalStateException("Cannot re-wrap a frozen ImmutableWireBase");
+        }
+        resetForReuse(buffer, offset, length);
+        this.frozen = true;
+    }
+
+    public final void wrapMultiSegments(byte[] buffer, long[] parentTape, int[] segTapeIndices, int segCount) {
+        if (frozen) {
+            throw new IllegalStateException("Cannot re-wrap a frozen ImmutableWireBase");
+        }
+        resetBaseState();
+        this.buf = buffer;
+        this.multiSegment = true;
+        int totalLen = 0;
+        for (int i = 0; i < segCount; i++) {
+            int segIdx = segTapeIndices[i];
+            int headerLen = (int) ((parentTape[(segIdx << 1) + 1] >>> 24) & 0x1FL);
+            int valOff = (int) (parentTape[segIdx << 1] >>> 32) + headerLen;
+            int recEnd = (int) parentTape[segIdx << 1];
+            totalLen += (recEnd - valOff);
+            scanRange(buffer, valOff, recEnd);
+        }
+        int firstSeg = segTapeIndices[0];
+        int firstHeader = (int) ((parentTape[(firstSeg << 1) + 1] >>> 24) & 0x1FL);
+        this.rawOffset = (int) (parentTape[firstSeg << 1] >>> 32) + firstHeader;
+        this.rawLength = totalLen;
+        this.scanned = true;
+        this.frozen = true;
+    }
+
+    public final void resetForReuse(byte[] buffer, int offset, int length) {
+        if (frozen) {
+            throw new IllegalStateException("Cannot resetForReuse a frozen ImmutableWireBase");
+        }
+        resetBaseState();
+        this.buf = buffer != null ? buffer : EMPTY_BYTES;
+        this.rawOffset = offset;
+        this.rawLength = length;
+    }
+
+    public final void resetForReuse(ByteString byteString) {
+        if (frozen) {
+            throw new IllegalStateException("Cannot resetForReuse a frozen ImmutableWireBase");
+        }
+        final byte[][] holder = new byte[1][];
+        final int[] range = new int[2];
+        try {
+            UnsafeByteOperations.unsafeWriteTo(byteString, new ByteOutput() {
+                @Override
+                public void write(byte value) {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                public void write(byte[] value, int offset, int len) {
+                    if (holder[0] == null) {
+                        holder[0] = value;
+                        range[0] = offset;
+                        range[1] = len;
+                    } else {
+                        byte[] flat = byteString.toByteArray();
+                        holder[0] = flat;
+                        range[0] = 0;
+                        range[1] = flat.length;
+                    }
+                }
+
+                @Override
+                public void writeLazy(byte[] value, int offset, int len) {
+                    write(value, offset, len);
+                }
+
+                @Override
+                public void write(ByteBuffer value) {
+                    byte[] flat = byteString.toByteArray();
+                    holder[0] = flat;
+                    range[0] = 0;
+                    range[1] = flat.length;
+                }
+
+                @Override
+                public void writeLazy(ByteBuffer value) {
+                    write(value);
+                }
+            });
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if (holder[0] == null) {
+            resetForReuse(EMPTY_BYTES, 0, 0);
+        } else {
+            resetForReuse(holder[0], range[0], range[1]);
+        }
+    }
+
+    private void resetBaseState() {
+        this.buf = EMPTY_BYTES;
+        this.rawOffset = 0;
+        this.rawLength = 0;
+        this.tapeCount = 0;
+        this.scanned = false;
+        this.multiSegment = false;
+        this.hasShadowedEntries = false;
+        resetBaseSlots();
+    }
+
+    protected abstract void resetBaseSlots();
+
+    // ==================== Tier 1: Thread-Safe Lazy Shallow Scanner ====================
+
+    public final void ensureScanned() {
+        if (!scanned) {
+            if (frozen) {
+                synchronized (this) {
+                    if (!scanned) {
+                        if (rawLength > 0) {
+                            scanRange(this.buf, this.rawOffset, this.rawOffset + this.rawLength);
+                        }
+                        this.scanned = true;
+                    }
+                }
+            } else {
+                if (rawLength > 0) {
+                    scanRange(this.buf, this.rawOffset, this.rawOffset + this.rawLength);
+                }
+                this.scanned = true;
+            }
+        }
+    }
+
+    private final WireTape.RawRecordSink rawSink = this::onRawRecord;
+
+    protected final void scanRange(byte[] b, int cursor, int limit) {
+        WireTape.scanWireRange(b, cursor, limit, rawSink);
+    }
+
+    private void onRawRecord(int fieldNumber, int wireType, int tagOffset, int recordEnd, int headerLen) {
+        int tapeIdx = appendTapeEntry(fieldNumber, wireType, tagOffset, recordEnd, headerLen);
+        onScanField(fieldNumber, wireType, tapeIdx);
+    }
+
+    protected final int appendTapeEntry(int fieldNumber, int wireType, int tagOffset, int recordEnd, int headerLen) {
+        int idx = this.tapeCount;
+        int wordIdx = idx << 1;
+        if (this.tape == EMPTY_TAPE) {
+            this.tape = new long[this.initialTapeWords];
+        } else if (wordIdx + 1 >= this.tape.length) {
+            this.tape = Arrays.copyOf(this.tape, this.tape.length << 1);
+        }
+        this.tape[wordIdx] = WireTape.packWord0(tagOffset, recordEnd);
+        this.tape[wordIdx + 1] = WireTape.packWord1(fieldNumber, wireType, KIND_UNKNOWN, headerLen, NO_AUX_IDX);
+        this.tapeCount = idx + 1;
+        return idx;
+    }
+
+    protected abstract void onScanField(int fieldNumber, int wireType, int tapeIdx);
+
+    // ==================== FieldTape Bit-Unpacking Accessors ====================
+
+    public final int tapeCount() { return tapeCount; }
+    public final int tapeTagOffset(int tapeIdx) { return (int) (tape[tapeIdx << 1] >>> 32); }
+    public final int tapeRecordEnd(int tapeIdx) { return (int) tape[tapeIdx << 1]; }
+    public final int tapeRecordLength(int tapeIdx) { long w0 = tape[tapeIdx << 1]; return (int) w0 - (int) (w0 >>> 32); }
+    public final int tapeHeaderLength(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 24) & 0x1FL); }
+    public final int tapeValueOffset(int tapeIdx) {
+        long w0 = tape[tapeIdx << 1];
+        long w1 = tape[(tapeIdx << 1) + 1];
+        return (int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL);
+    }
+    public final int tapeValueLength(int tapeIdx) {
+        long w0 = tape[tapeIdx << 1];
+        long w1 = tape[(tapeIdx << 1) + 1];
+        return (int) w0 - ((int) (w0 >>> 32) + (int) ((w1 >>> 24) & 0x1FL));
+    }
+    public final int tapeFieldNumber(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] >>> 35); }
+    public final int tapeWireType(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 32) & 0x7L); }
+    public final int tapeKind(int tapeIdx) { return (int) ((tape[(tapeIdx << 1) + 1] >>> 29) & 0x7L); }
+    public final int tapeAuxIndex(int tapeIdx) { return (int) (tape[(tapeIdx << 1) + 1] & 0xFFFFFFL); }
+
+    protected final void setTapeKindAndAux(int tapeIdx, int kind, int auxIndex) {
+        int w1Idx = (tapeIdx << 1) + 1;
+        tape[w1Idx] = (tape[w1Idx] & ~((0x7L << 29) | 0xFFFFFFL))
+                | ((long) (kind & 0x7) << 29)
+                | (auxIndex & 0xFFFFFFL);
+    }
+
+    protected final void setTapeKind(int tapeIdx, int kind) {
+        int w1Idx = (tapeIdx << 1) + 1;
+        tape[w1Idx] = (tape[w1Idx] & ~(0x7L << 29)) | ((long) (kind & 0x7) << 29);
+    }
+}

@@ -103,44 +103,44 @@ flowchart TD
 每当 `ShallowScanner` 扫描一层消息时，不会创建任何 `Field` 对象，而是向一块预分配/可复用的连续内存 `FieldTape` 追加 16 字节（或两个 `uint64_t` / `long`）的 `TapeEntry`。4 个 `TapeEntry` 恰好填满一条 64-Byte CPU Cache Line：
 
 ```text
-TapeEntry (128 bits = 2 x 64-bit Words):
+Java TapeEntry (128 bits = 2 x 64-bit Words, shared by WireTape & ImmutableWireBase):
 ┌───────────────────────────────────────┬───────────────────────────────────────┐
 │ Word 0 [63..32]: tagOffset (uint32)   │ Word 0 [31..0]: recordEnd (uint32)    │
-├──────────────────────┬────────┬───────┼───────────────────────────────────────┤
-│ Word 1 [63..35]:     │ [34..32│[31..28│ Word 1 [27..24]: │ Word 1 [23..0]:    │
-│ fieldNumber (29-bit) │wireType│ flags │ headerLen (4-bit)│ nextTapeIdx(24-bit)│
+├──────────────────────┬────────┬───────┼──────────────────┬────────────────────┤
+│ Word 1 [63..35]:     │[34..32]│[31..29│ Word 1 [28..24]: │ Word 1 [23..0]:    │
+│ fieldNumber (29-bit) │wireType│fl/kind│ headerLen (5-bit)│ auxIndex (24-bit)  │
 └──────────────────────┴────────┴───────┴──────────────────┴────────────────────┘
+
+C++20 TapeEntry (128 bits = alignas(16) struct):
+  uint32_t tag_offset | uint32_t record_end | uint32_t tag (29-bit fn + 3-bit wt)
+  | uint8_t header_len | uint8_t flags | uint16_t reserved
 ```
 
 #### 字段精确定义与巧妙之处：
 1. **`tagOffset` (32-bit)**：该字段的 Tag Varint 在输入缓冲区中的起始偏移（支持单消息最大 4GB）。
 2. **`recordEnd` (32-bit)**：该字段净荷（Value）结束后的下一个字节偏移。
    - **完整原始字节区间** = `[tagOffset, recordEnd)`，总长度 = `recordEnd - tagOffset`。
-3. **`headerLen` (4-bit, `0..15`)**：`valueOffset - tagOffset`，即 `Tag Varint` +（可选的 `Length Varint`）占用的字节数。
-   - 因为 Tag Varint 最多 5 字节，Length Varint 最多 5 字节，两者之和恒 $\le 10 < 15$！
-   - 因此，**无需浪费一个 32-bit 整数存储 `valueOffset`**，通过 `valueOffset = tagOffset + headerLen` 即可在 1 个指令周期内算出净荷起始位置，同时算出净荷长度 `valueLen = recordEnd - valueOffset`！
+3. **`headerLen`（Java 5-bit `0..31` / C++ `uint8_t`）**：`valueOffset - tagOffset`，即 `Tag Varint` +（可选的 `Length Varint`）占用的字节数。
+   - 即使面对非规范的 10-byte Overlong Tag + 10-byte Overlong Length（总长 20 字节），5-bit (`<= 31`) 与 `uint8_t` 均无截断风险！
+   - **无需额外 32-bit 存储 `valueOffset`**，通过 `valueOffset = tagOffset + headerLen` 即可在 1 个指令周期内算出净荷起始位置与长度 `valueLen = recordEnd - valueOffset`。
 4. **`wireType` (3-bit, `0..5`)**：`0=Varint, 1=Fixed64, 2=LengthDelimited, 5=Fixed32`。
-5. **`flags` (4-bit 状态位)**：
-   - `0000 (CLEAN_RAW)`：原始未修改（可能已读并缓存，但值未变）。
-   - `0001 (DIRTY_SAME_SIZE)`：值被修改，但新编码长度与原净荷长度 `valueLen` **完全相等**（可走原地覆写 Fast-Path 1）。
-   - `0010 (DIRTY_VAR_SIZE)`：值被修改且编码长度发生变化，或子消息内部发生了变长修改。
-   - `0011 (DELETED)`：被用户显式调用 `clearXxx()` / `remove()` 删除。
-   - `0100 (SHADOWED)`：同一个非 `repeated` 标量字段在原始输入流后面再次出现，导致当前旧条目被覆盖失效。
-6. **`nextTapeIdx` (24-bit, 最大支持单层 1600 万个条目)**：
-   - 对于 `repeated` 字段（或分段传输的同名子消息），指向下一个具有相同 `fieldNumber` 的 `TapeEntry` 下标（`0xFFFFFF` 表示链表尾 `NULL`）。**完全用数组下标静态单链表替代了 `ArrayList`！**
+5. **`flags` / `kind` (3-bit 状态/类型位)**：
+   - **Lower Level（`WireTape` / C++ `TapeEntry.flags`）**：内联写状态 `FLAG_CLEAN_RAW (0)`、`FLAG_DIRTY_SAME_SIZE (1)`、`FLAG_DIRTY_VAR_SIZE (2)`、`FLAG_DELETED (3)`、`FLAG_SHADOWED (4)`、`FLAG_SPLIT_CONT (5)`、`FLAG_SPLIT_TAIL (6)`；
+   - **Java Compat Layer（`ImmutableWireBase.kind`）**：只读记录种类 `KIND_UNKNOWN (0)`、`KIND_SHADOWED (1)`、`KIND_SCALAR_SLOT (2)`、`KIND_SPLIT_SUB_CONT (3)`、`KIND_SPLIT_SUB_TAIL (4)`、`KIND_REPEATED_ITEM (5)`，所有写状态外置在 `WireOverlay` 中。
+6. **`auxIndex` (24-bit, 最大支持 1600 万槽位/列表项)**：
+   - 在 Compat `ImmutableWireBase` 中直接存放槽位号（`SLOT_*`）或 `repeated` 元素序号（`ordinal`），配合紧凑的 `int[] itemTapeIdx` / C++ `SmallPodList<uint32_t, 128>` 实现 $O(1)$ 随机索引与二分/直接定位（无需 `ArrayList` 装箱对象）。
 
 ### 4.2 O(1) 字段查找目录（`FieldDirectory`）
 
 当用户调用 `msg.getField(fieldNumber)` 时，如何避免遍历 `FieldTape`？
 
-- **静态代码生成模式（Generated `LazyMessage`）**：
-  - 编译器已知 `.proto` 中定义的所有字段号。代码生成器将每个字段映射为编译期常量密集下标 `SLOT_0, SLOT_1, ..., SLOT_K`，类中持有一个定长原生数组 `int[] slotToTapeIdx`（对于 `repeated` 字段则额外记录 `slotToTailTapeIdx` 和 `slotCount`）。
+- **静态类型模式（`LazyOrderEnvelope` / `RawOrderEnvelope` / C++ `OrderEnvelopeView`）**：
+  - 已知 `.proto` 中定义的所有字段号，将每个字段映射为编译期常量密集下标 `SLOT_0, SLOT_1, ..., SLOT_K`，类中持有一个定长原生数组 `int[] slotTapeIdx`（`repeated` 字段另存紧凑下标数组 `itemTapeIdx` / `SmallPodList`）。
   - 查找复杂度：严格的 **$O(1)$ 数组寻址（1 次内存读取）**。
-- **动态模式（`ProtoDocument`）**：
-  - 采用 **“小字段号直达表 + 开放寻址溢出表”** 混合结构：
-    - 95% 以上的 Protobuf 字段号在 `1..64` 之间：内置 `int directMap[65]`，字段号 `1..64` 直接 $O(1)$ 查表；
-    - 字段号 `> 64`：落入一个紧凑的 2 的幂次大小线性探测哈希数组 `long[] sparseMap`。
-  - 重置开销：维护一个 `presentMask64` 位图，重置 `directMap` 时无需 `memset` 整个数组，仅需按位清除置位过的槽位或递增 `epoch` 版本号！
+- **动态无 Schema 模式（`ProtoDocument` / `RawWireView` / C++ `WireView`）**：
+  - 采用 **“小字段号直达表 + 线性回退”** 混合结构：
+    - 小字段号（`ProtoDocument` 为 `1..64`，`RawWireView` / C++ `WireView` 为 `1..32`）：通过定长 `int directMap[]` 直接 $O(1)$ 查表；
+    - 超出直达范围的大字段号（最高支持 29-bit `536,870,911`）：回退到紧凑原生槽位/磁带扫描（未来在超宽动态 Schema 下可平滑替换为开放寻址哈希表 `sparseMap`）。
 
 ### 4.3 64-Bit 状态位图加速器（Bitmask Acceleration）
 
@@ -618,13 +618,15 @@ stateDiagram-v2
      - 若子视图发生修改：仅在**该子视图自身 `isMultiSegment() == true`** 时，才将父 `FieldTape` 中该子消息的前序分段标为 `FLAG_SHADOWED`、尾分段标为 `FLAG_DIRTY_VAR_SIZE`，在尾分段位置一次性写出合并后的完整子消息。
    - **重复字段 (`repeated message / scalar`)**：同样通过 `nextTapeIdx` 串联所有元素，但该链表代表独立元素序列 `0..N-1`，修改第 `k` 个元素时仅更新 `indexToTapeIdx[k]` 对应的单条 `TapeEntry`（`child.isMultiSegment() == false`，绝不触发多段折叠！）。
 
-2. **动态无 Schema 类（`ProtoDocument`）**：
-   - **扫描期零假设（Zero-Assumption Scan）**：`ProtoDocument.onScanField` **绝不将任何重复 Tag 标记为 `FLAG_SHADOWED`**！所有记录保持 `FLAG_CLEAN_RAW`，从而保证未触碰的 `unpacked repeated` 标量字段在修改其他字段后依然 **100% 完整保留，绝不发生误裁剪**。
+2. **动态无 Schema 类（`ProtoDocument` / `RawWireView` / C++ `WireView`）**：
+   - **扫描期零假设（Zero-Assumption Scan）**：扫描时 **绝不将任何重复 Tag 标记为 `SHADOWED`**！所有记录保持只读/原始态，从而保证未触碰的 `unpacked repeated` 标量字段在修改其他字段后依然 **100% 完整保留，绝不发生误裁剪**。
    - **操作期按语义消歧**：
-     - 读取单值 `getInt32(f)` / `getString(f)`：返回最后一条匹配 `fieldNumber` 且 `wireType` 合法的记录；
-     - 读取子消息 `at(f)`：自动收集所有 `fieldNumber == f && wireType == LEN` 的分段并合并为多段子文档视图；
-     - 写入单值 `setInt32(f, v)` / `setString(f, v)`：若原 Tape 中存在 `f`，将最后一条更新为新值并将前序同名记录标为 `FLAG_SHADOWED`；若原 Tape 中不存在 `f`（**缺字段插入**），写入独立的 `appendedFields` 表并在序列化尾部追加输出；
-   - **连续只读导航与已追加 `LEN` 读取**：`doc.at(1).at(2)`（缺失路径）绝不修改 `has()` 或多输出空子消息；`setString(2, payload)` 后调用 `doc.at(2)` 直接基于 `appendedBytes` 包装只读视图，绝不丢弃净荷。
+     - 读取单值 `getInt32(f)` / `getFixed32(f)` / `getFixed64(f)` / `getDouble(f)` / `getString(f)`：返回最后一条匹配 `fieldNumber` 且 `wireType` 合法的记录；
+     - 读取子消息 `at(f)` / `sub(f)`：自动收集所有 `fieldNumber == f && wireType == LEN` 的分段并合并为多段子视图；
+     - 写入单值：
+       - **Lower Level（`RawWireView` / C++ `WireView`）**：原地将前序同名 Tape 条目标为 `FLAG_SHADOWED`，仅当 `repCount == 1` 且新旧净荷等长时才允许走 Fast-Path 1；缺失字段标记为 `appended` 在尾部追加；
+       - **Java Compat（`ProtoDocument`）**：绝不修改只读 `DocBase` Tape，而是将覆盖值/删除态/子文档增量写入外部 COW `DocOverlay`，序列化时由 `WireMergeEngine` + `DocAdapter` 动态跳过前序重复条目并合并输出。
+   - **连续只读导航与已追加 `LEN` 读取**：`doc.at(1).at(2)`（缺失路径）绝不修改 `has()` 或多输出空子消息；`setString(2, payload)` 后调用 `doc.at(2)` 直接基于 `DocOverlay` 中的字节包装只读视图，绝不丢弃净荷。
 
 ---
 
@@ -726,19 +728,35 @@ flowchart TD
 
 ```text
 lazy-proto/
-├── DESIGN.md                  # 全局与分层架构设计文档
-├── TECHNICAL_REPORT.md        # 跨语言真实基线评测报告
-├── proto/order_envelope.proto # 统一 Cross-Language Benchmark & Oracle Schema
-├── src/main/java/io/lazyproto/
-│   ├── wire/                  # Lower-Level 物理编解码 (WireFormat, WireReader, WireWriter, Utf8Slice; 零 protobuf-java 依赖)
-│   ├── core/                  # Java Lower-Level 引擎 (WireTape, ScratchUtf8Arena, RawOrderEnvelope, RawWireView; 零 protobuf-java 依赖)
-│   ├── runtime/               # Java Intermediate Compat 底座 (ImmutableWireBase, WireOverlay, WireMergeEngine, AbstractLazyMessage/Builder, ProtobufCompat)
-│   ├── dynamic/               # Java Compat 动态无 Schema 文档 (ProtoDocument)
-│   └── model/                 # Java Compat 接口适配类 (OrderInterfaces, LazyOrderProto, 手写 StandardOrderProto 基线)
+├── pom.xml                           # Maven 多模块父 POM
+├── DESIGN.md                         # 全局与分层架构设计文档
+├── TECHNICAL_REPORT.md               # 跨语言真实基线评测报告
+├── proto/order_envelope.proto        # 统一 Cross-Language Benchmark & Oracle Schema
+├── lazy-proto-core/                  # Java Lower-Level 独立模块（编译期零 protobuf-java 依赖）
+│   └── src/main/java/io/lazyproto/
+│       ├── wire/                     # 物理编解码 (WireFormat, WireReader, WireWriter, Utf8Slice)
+│       └── core/                     # 底层引擎 (WireTape, ScratchUtf8Arena, RawWireView, RawOrderEnvelope)
+├── lazy-proto-compat/                # Java Intermediate Compat 模块 (依赖 lazy-proto-core + protobuf-java)
+│   └── src/main/java/io/lazyproto/
+│       ├── runtime/                  # ImmutableWireBase, WireOverlay, WireMergeEngine, AbstractLazyMessage/Builder, ProtobufCompat
+│       ├── dynamic/                  # 动态无 Schema 文档 (ProtoDocument)
+│       └── model/                    # 接口适配类 (OrderInterfaces, LazyOrderProto)
+├── lazy-proto-benchmarks/            # 官方 protoc 对拍测试、状态机 Fuzzers、手写 Eager 基线与微基准
+│   └── src/
+│       ├── main/java/io/lazyproto/model/StandardOrderProto.java
+│       └── test/java/io/lazyproto/   # LazyProtoCorrectnessTest, StatefulModelFuzzTest, LowerLevelFuzzAndRegressionTest, LazyProtoBenchmarkSuite
 └── cpp/
-    ├── lazy_proto.hpp         # C++20 纯 Lower-Level Input-Bytes Wrapper (TapeStorage, ScratchArena, WireView, OrderEnvelopeView; 无官方接口兼容)
-    ├── std_proto.hpp          # 手写 Eager C++ 基线
-    └── benchmark_main.cpp     # C++ 正确性验证与双生命周期微基准
+    ├── include/lazyproto/
+    │   ├── wire.hpp                  # SWAR Varint、WireWriter、ScratchArena
+    │   ├── tape.hpp                  # 16B TapeEntry、TapeStorage、scan_wire_range、write_spliced_tape
+    │   ├── wire_view.hpp             # 通用无 Schema WireView（显式 FieldState 状态机）
+    │   └── order_envelope_view.hpp   # 强类型 OrderEnvelopeView / UserProfileView / LineItemView
+    ├── lazy_proto.hpp                # 伞状头文件入口（兼容直接 #include "lazy_proto.hpp"）
+    ├── tests/test_main.cpp           # C++ 正确性回归与状态机 Fuzzers（支持 -O3 / -DNDEBUG / ASan+UBSan）
+    └── bench/
+        ├── fixture.hpp               # 共享测试包构造器
+        ├── std_proto.hpp             # 手写 Eager C++ 基线
+        └── benchmark_main.cpp        # 双生命周期微基准套件
 ```
 
 ---

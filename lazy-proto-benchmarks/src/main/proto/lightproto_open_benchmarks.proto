@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package lazyproto.bench.open.lightproto;
+
+option java_package = "io.lazyproto.bench.open.lightproto";
+option java_multiple_files = true;
+
+message Media {
+  enum Player {
+    JAVA = 0;
+    FLASH = 1;
+  }
+  string uri = 1;
+  string title = 2;
+  int32 width = 3;
+  int32 height = 4;
+  string format = 5;
+  int64 duration = 6;
+  int64 size = 7;
+  int32 bitrate = 8;
+  repeated string person = 9;
+  Player player = 10;
+  string copyright = 11;
+}
+
+message Image {
+  enum Size {
+    SMALL = 0;
+    LARGE = 1;
+  }
+  string uri = 1;
+  string title = 2;
+  int32 width = 3;
+  int32 height = 4;
+  Size size = 5;
+}
+
+message MediaContent {
+  Media media = 1;
+  repeated Image image = 2;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message PulsarMessageMetadata {
+  string producer_name = 1;
+  uint64 sequence_id = 2;
+  uint64 publish_time = 3;
+  repeated KeyValue properties = 4;
+  string replicated_from = 5;
+  string partition_key = 6;
+  int32 compression = 9;
+  uint32 uncompressed_size = 10;
+  int32 num_messages_in_batch = 11;
+  uint64 event_time = 12;
+  bytes schema_version = 15;
+  int64 deliver_at_time = 19;
+}
+
+message OtelResource {
+  repeated KeyValue attributes = 1;
+  uint32 dropped_attributes_count = 2;
+}
+
+message OtelScope {
+  string name = 1;
+  string version = 2;
+}
+
+message OtelSpan {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  bytes parent_span_id = 4;
+  string name = 5;
+  int32 kind = 6;
+  fixed64 start_time_unix_nano = 7;
+  fixed64 end_time_unix_nano = 8;
+  repeated KeyValue attributes = 9;
+  int32 status_code = 15;
+}
+
+message OtelScopeSpans {
+  OtelScope scope = 1;
+  repeated OtelSpan spans = 2;
+  string schema_url = 3;
+}
+
+message OtelResourceSpans {
+  OtelResource resource = 1;
+  repeated OtelScopeSpans scope_spans = 2;
+  string schema_url = 3;
+}
+
+message OtelExportTraceRequest {
+  repeated OtelResourceSpans resource_spans = 1;
+}

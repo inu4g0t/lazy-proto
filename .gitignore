@@ -1,5 +1,6 @@
 # Maven / Java build artifacts
 target/
+**/target/
 *.class
 *.jar
 *.war
@@ -7,8 +8,15 @@ target/
 *.log
 
 # C++ compiled binaries & generated proto sources
+cpp/test_cpp
+cpp/test_cpp_ndebug
+cpp/test_cpp_asan
 cpp/benchmark_cpp
+cpp/benchmark_open_cpp
+cpp/benchmark_cpp_ndebug
+cpp/benchmark_cpp_asan
 cpp/gen/
+cpp/third_party/
 *.o
 *.out
 *.exe
